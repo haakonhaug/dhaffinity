@@ -17,7 +17,8 @@ other CCD. The mod widens the process mask itself and enforces the split per thr
 > **Status: beta.** Tested on one Windows 11 machine (Ryzen 9 9950X3D, Distant Horizons 3.2.0-b, Fabric 1.21.11) plus the
 > Linux backend's unit tests. Off-thread GPU upload is on by default and falls back to DH's normal path automatically on any
 > GL error; it can also be switched off in the menu. The hot-path hooks are matched against DH 3.2.x and disable themselves
-> (leaving plain core pinning) if a future DH build changes those internals. If something misbehaves, run `/dhaffinity profile 40` and `/dhaffinity status` and include both outputs in your report.
+> (leaving plain core pinning) if a future DH build changes those internals. If something misbehaves, run `/dhaffinity profile 40` and `/dhaffinity status` and include both outputs in a report at
+> https://github.com/haakonhaug/dhaffinity/issues.
 
 ## Install
 
