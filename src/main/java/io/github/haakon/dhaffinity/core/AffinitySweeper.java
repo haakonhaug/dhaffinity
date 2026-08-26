@@ -112,10 +112,20 @@ public final class AffinitySweeper implements Runnable {
 	/** The configuration changed: forget failure backoffs and sweep as soon as possible. */
 	public void configChanged() {
 		resetBackoff = true;
+		synchronized (nameCache) {
+			nameCache.clear();
+		}
 		poke();
 	}
 
 	private volatile Map<String, Integer> lastChunkGenNames = Map.of();
+	/**
+	 * OS thread names by tid, refreshed every {@link #NAME_REFRESH_SWEEPS} sweeps (a name lookup is an
+	 * extra OS call per thread; names do not change, and a reused tid is re-read within seconds).
+	 * {@code ""} records "no name" so unnamed native threads are not re-queried every sweep.
+	 */
+	private final Map<Long, String> nameCache = new HashMap<>();
+	static final int NAME_REFRESH_SWEEPS = 5;
 
 	public Stats stats() {
 		return stats;
@@ -241,7 +251,7 @@ public final class AffinitySweeper implements Runnable {
 				desired = cfg.mainThreadMask;
 				kind = "main thread";
 			} else {
-				String name = chunkGen ? backend.threadName(tid) : null;
+				String name = chunkGen ? cachedThreadName(backend, tid, sweepNo) : null;
 				if (name != null && cfg.isChunkGenThread(name)) {
 					chunkGenSeen++;
 					chunkGenNames.merge(namePrefix(name), 1, Integer::sum);
@@ -289,6 +299,9 @@ public final class AffinitySweeper implements Runnable {
 				case GONE -> {
 					gone++;
 					clearFailure(tid);
+					synchronized (nameCache) {
+						nameCache.remove(tid);
+					}
 					if (dh != null && registryOnly != null) {
 						registry.unregisterIfSame(tid, dh);
 					}
@@ -308,13 +321,16 @@ public final class AffinitySweeper implements Runnable {
 			}
 		}
 
-		if (!retryAtSweep.isEmpty()) {
+		if (!retryAtSweep.isEmpty() || !nameCache.isEmpty()) {
 			Set<Long> alive = new HashSet<>(tids.length * 2);
 			for (long tid : tids) {
 				alive.add(tid);
 			}
 			retryAtSweep.keySet().retainAll(alive);
 			failStreak.keySet().retainAll(alive);
+			synchronized (nameCache) {
+				nameCache.keySet().retainAll(alive);
+			}
 		}
 
 		long durationMicros = (System.nanoTime() - t0) / 1_000L;
@@ -326,6 +342,22 @@ public final class AffinitySweeper implements Runnable {
 		lastChunkGenNames = Collections.unmodifiableMap(chunkGenNames);
 		stats = new Stats(sweepNo, tids.length, dhSeen, chunkGenSeen, corrected, unchanged, skipped, gone, failed,
 				durationMicros, maxDurationMicros, totalCorrected, totalFailed, processMaskResets, System.currentTimeMillis());
+	}
+
+	/** Cached OS thread name; looked up on the first sight of a tid and again every NAME_REFRESH_SWEEPS sweeps. */
+	private String cachedThreadName(AffinityBackend backend, long tid, long sweepNo) {
+		boolean refresh = sweepNo % NAME_REFRESH_SWEEPS == 1;
+		synchronized (nameCache) {
+			String cached = nameCache.get(tid);
+			if (cached != null && !refresh) {
+				return cached.isEmpty() ? null : cached;
+			}
+		}
+		String name = backend.threadName(tid);
+		synchronized (nameCache) {
+			nameCache.put(tid, name == null ? "" : name);
+		}
+		return name;
 	}
 
 	/** Thread-name prefixes that matched the chunk-generation patterns in the last sweep, with counts. */

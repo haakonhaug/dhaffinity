@@ -37,8 +37,11 @@ final class FakeBackend implements AffinityBackend {
 		}
 	}
 
+	int nameLookups;
+
 	@Override
 	public String threadName(long tid) {
+		nameLookups++;
 		return names.get(tid);
 	}
 

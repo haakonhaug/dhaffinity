@@ -82,6 +82,39 @@ class AffinitySweeperTest {
 	}
 
 	@Test
+	void threadNamesAreCachedAndRefreshedPeriodically() {
+		FakeBackend os = new FakeBackend();
+		os.addThread(30, ALL, "Worker-Main-3");
+		os.addThread(31, ALL, "Netty Client IO #1");
+		os.addThread(32, ALL, null);
+		DhAffinity core = DhAffinity.createDetached(os, TestConfigs.split());
+		AffinitySweeper sweeper = core.createSweeperForTest();
+
+		sweeper.sweepOnce();
+		assertEquals(3, os.nameLookups); // first sight: every thread, including the unnamed one
+		sweeper.sweepOnce();
+		sweeper.sweepOnce();
+		assertEquals(3, os.nameLookups); // cached, nothing re-read
+		assertEquals(DH, os.threads.get(30L));
+
+		// The tid of the Netty thread is reused by a chunk-generation worker: picked up at the next refresh.
+		os.names.put(31L, "c2me-worker-4");
+		for (int i = 0; i < AffinitySweeper.NAME_REFRESH_SWEEPS; i++) {
+			sweeper.sweepOnce();
+		}
+		assertEquals(DH, os.threads.get(31L));
+		assertTrue(os.nameLookups >= 6 && os.nameLookups <= 9, "lookups: " + os.nameLookups);
+
+		// A thread that exits drops out of the cache; a config change clears it entirely.
+		os.threads.remove(32L);
+		sweeper.sweepOnce();
+		int before = os.nameLookups;
+		sweeper.configChanged();
+		sweeper.sweepOnce();
+		assertEquals(before + 2, os.nameLookups);
+	}
+
+	@Test
 	void chunkGenerationIsNotAppliedWhenNonDhThreadsAreUnmanaged() {
 		FakeBackend os = new FakeBackend();
 		os.addThread(30, ALL, "Worker-Main-3");
