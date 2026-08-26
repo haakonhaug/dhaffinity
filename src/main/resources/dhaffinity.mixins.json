@@ -1,0 +1,22 @@
+{
+	"required": false,
+	"minVersion": "0.8",
+	"package": "io.github.haakon.dhaffinity.mixin",
+	"compatibilityLevel": "JAVA_21",
+	"plugin": "io.github.haakon.dhaffinity.mixin.DhAffinityMixinPlugin",
+	"mixins": [
+		"PriorityTaskPickerExecutorMixin",
+		"ThreadPoolUtilMixin",
+		"RenderThreadTaskHandlerMixin",
+		"RenderThreadTaskHandlerInvoker",
+		"GLBufferMixin",
+		"KeyedClientLevelManagerMixin",
+		"ClientLevelWrapperMixin"
+	],
+	"injectors": {
+		"defaultRequire": 0
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}

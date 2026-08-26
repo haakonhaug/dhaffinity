@@ -1,0 +1,106 @@
+plugins {
+	id 'net.fabricmc.fabric-loom-remap' version "${loom_version}"
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+	archivesName = project.archives_base_name
+}
+
+repositories {
+	// Distant Horizons is published to the Modrinth maven.
+	exclusiveContent {
+		forRepository {
+			maven {
+				name = 'Modrinth'
+				url = 'https://api.modrinth.com/maven'
+			}
+		}
+		filter {
+			includeGroup 'maven.modrinth'
+		}
+	}
+}
+
+loom {
+	runs {
+		client {
+			// ./gradlew runClient -PquickPlayWorld=Epic -PstatusLogSeconds=15  (automated in-world check)
+			if (project.hasProperty('quickPlayWorld')) {
+				programArgs '--quickPlaySingleplayer', project.property('quickPlayWorld').toString()
+			}
+			if (project.hasProperty('statusLogSeconds')) {
+				vmArgs "-Ddhaffinity.statusLogSeconds=${project.property('statusLogSeconds')}"
+			}
+			if (project.hasProperty('autoProfileSeconds')) {
+				vmArgs "-Ddhaffinity.autoProfileSeconds=${project.property('autoProfileSeconds')}"
+			}
+			if (project.hasProperty('gpuUploadFailContext')) {
+				vmArgs '-Ddhaffinity.gpuUpload.failContext=true'
+			}
+		}
+	}
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	mappings loom.officialMojangMappings()
+	modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+	// Compile against DH so the mixin target resolves; never bundled.
+	modCompileOnly "maven.modrinth:distanthorizons:${project.dh_version}"
+	// ModMenu "Configure" entrypoint; optional at runtime, never bundled.
+	modCompileOnly "maven.modrinth:modmenu:${project.modmenu_version}"
+
+	// Only for `gradlew runClient` smoke tests; not part of the published jar.
+	modLocalRuntime "maven.modrinth:distanthorizons:${project.dh_version}"
+	modLocalRuntime "maven.modrinth:modmenu:${project.modmenu_version}"
+
+	// JNA ships with Minecraft itself (see the 1.21.11 version manifest), so it is on the
+	// runtime classpath in-game. Tests run without Minecraft, so they need it explicitly.
+	testImplementation "net.java.dev.jna:jna:${project.jna_version}"
+	testImplementation "net.java.dev.jna:jna-platform:${project.jna_version}"
+	testImplementation platform("org.junit:junit-bom:${project.junit_bom_version}")
+	testImplementation 'org.junit.jupiter:junit-jupiter'
+	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+	testRuntimeOnly "org.slf4j:slf4j-simple:${project.slf4j_simple_version}"
+}
+
+processResources {
+	inputs.property 'version', project.version
+
+	filesMatching('fabric.mod.json') {
+		expand 'version': project.version
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.release = 21
+	it.options.encoding = 'UTF-8'
+}
+
+java {
+	withSourcesJar()
+
+	sourceCompatibility = JavaVersion.VERSION_21
+	targetCompatibility = JavaVersion.VERSION_21
+}
+
+test {
+	useJUnitPlatform()
+	testLogging {
+		events 'passed', 'skipped', 'failed'
+		exceptionFormat 'full'
+	}
+}
+
+jar {
+	inputs.property 'archivesName', project.base.archivesName
+
+	from('LICENSE') {
+		rename { "${it}_${project.base.archivesName.get()}" }
+	}
+}

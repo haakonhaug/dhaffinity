@@ -1,0 +1,44 @@
+{
+	"schemaVersion": 1,
+	"id": "dhaffinity",
+	"version": "${version}",
+	"name": "DH Affinity",
+	"description": "Stutter-free Distant Horizons on multi-CCD CPUs: pins DH's worker threads to the cores you choose (e.g. the non-V-cache CCD of a Ryzen 9950X3D), uploads finished LOD terrain to the GPU off the render thread with adaptive pacing, and bypasses two DH locks that stall the render thread. In-game menu, any CPU.",
+	"authors": [
+		"Haakon"
+	],
+	"contact": {
+		"homepage": "https://modrinth.com/mod/dhaffinity",
+		"sources": "https://github.com/haakonhaug/dhaffinity",
+		"issues": "https://github.com/haakonhaug/dhaffinity/issues"
+	},
+	"license": "MIT",
+	"icon": "assets/dhaffinity/icon.png",
+	"environment": "client",
+	"entrypoints": {
+		"preLaunch": [
+			"io.github.haakon.dhaffinity.DhAffinityPreLaunch"
+		],
+		"client": [
+			"io.github.haakon.dhaffinity.client.DhAffinityClient"
+		],
+		"modmenu": [
+			"io.github.haakon.dhaffinity.client.DhAffinityModMenu"
+		]
+	},
+	"mixins": [
+		"dhaffinity.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.19.3",
+		"minecraft": "~1.21.11",
+		"java": ">=21",
+		"distanthorizons": ">=3.2.0- <3.3.0-",
+		"fabric-command-api-v2": "*",
+		"fabric-lifecycle-events-v1": "*",
+		"fabric-rendering-v1": "*"
+	},
+	"suggests": {
+		"modmenu": "*"
+	}
+}
