@@ -211,14 +211,36 @@ class AffinityConfigTest {
 	}
 
 	@Test
+	void oldFilesGetTheNewUploadDefaultOnce(@TempDir Path dir) throws Exception {
+		Path file = dir.resolve("dhaffinity.json");
+		// A 1.0.0/1.0.1 file: no configVersion, upload explicitly on.
+		Files.writeString(file, "{\n  \"gameMask\": \"0-15\",\n  \"dhMask\": \"16-31\",\n  \"offThreadGpuUpload\": true,\n  \"uploadPacing\": \"4\"\n}", StandardCharsets.UTF_8);
+		AffinityConfig.Json json = AffinityConfig.readOrCreate(file, LOG, AffinityConfig.Json::new);
+		assertFalse(json.offThreadGpuUpload, "migrated off");
+		assertEquals(AffinityConfig.CURRENT_CONFIG_VERSION, json.configVersion);
+		assertEquals("4", json.uploadPacing, "other settings untouched");
+		String rewritten = Files.readString(file, StandardCharsets.UTF_8);
+		assertTrue(rewritten.contains("\"configVersion\": " + AffinityConfig.CURRENT_CONFIG_VERSION), rewritten);
+		assertTrue(rewritten.contains("\"offThreadGpuUpload\": false"), rewritten);
+
+		// The user turns it back on deliberately: a current-version file is never migrated again.
+		json.offThreadGpuUpload = true;
+		AffinityConfig.write(file, json);
+		AffinityConfig.Json again = AffinityConfig.readOrCreate(file, LOG, AffinityConfig.Json::new);
+		assertTrue(again.offThreadGpuUpload, "explicit choice kept");
+		assertEquals(AffinityConfig.CURRENT_CONFIG_VERSION, AffinityConfig.defaultsFor(ALL32, X3D).configVersion);
+	}
+
+	@Test
 	void gpuUploadAndBudgetKeys() {
 		AffinityConfig.Json json = new AffinityConfig.Json();
-		assertTrue(AffinityConfig.resolve(json, ALL32, LOG).offThreadGpuUpload, "default on");
+		assertFalse(AffinityConfig.resolve(json, ALL32, LOG).offThreadGpuUpload, "off by default since 1.0.2");
 		assertEquals(0, AffinityConfig.resolve(json, ALL32, LOG).renderThreadTaskBudgetMs);
-		json.offThreadGpuUpload = false;
+		json.offThreadGpuUpload = true;
 		json.renderThreadTaskBudgetMs = 3;
 		AffinityConfig cfg = AffinityConfig.resolve(json, ALL32, LOG);
-		assertFalse(cfg.offThreadGpuUpload);
+		assertTrue(cfg.offThreadGpuUpload);
+		json.offThreadGpuUpload = false;
 		assertEquals(3, cfg.renderThreadTaskBudgetMs);
 		json.renderThreadTaskBudgetMs = 999;
 		AffinityConfig clamped = AffinityConfig.resolve(json, ALL32, LOG);

@@ -115,6 +115,74 @@ class AffinitySweeperTest {
 	}
 
 	@Test
+	void chunkGenerationOnlyAppliesWithALocalWorld() {
+		FakeBackend os = new FakeBackend();
+		os.addThread(30, ALL, "Worker-Main-3");
+		DhAffinity core = DhAffinity.createDetached(os, TestConfigs.split());
+		AffinitySweeper sweeper = core.createSweeperForTest();
+		core.setLocalWorld(false); // joined a remote server: those threads do no terrain generation there
+		sweeper.sweepOnce();
+		assertEquals(GAME, os.threads.get(30L));
+		core.setLocalWorld(true);
+		sweeper.sweepOnce();
+		assertEquals(DH, os.threads.get(30L));
+	}
+
+	@Test
+	void threadsThatKeepMovingThemselvesBackAreLeftAlone() {
+		FakeBackend os = new FakeBackend();
+		os.addThread(10, ALL);
+		os.addThread(11, ALL);
+		DhAffinity core = DhAffinity.createDetached(os, TestConfigs.split());
+		AffinitySweeper sweeper = core.createSweeperForTest();
+		for (int i = 0; i < AffinitySweeper.STICKY_LIMIT; i++) {
+			sweeper.sweepOnce();
+			assertEquals(GAME, os.threads.get(10L));
+			os.threads.put(10L, ALL); // a driver keeps resetting thread 10 between sweeps
+		}
+		int writes = os.writes;
+		sweeper.sweepOnce();
+		assertEquals(ALL, os.threads.get(10L), "no longer fought over");
+		assertEquals(writes, os.writes, "no write for the sticky thread");
+		assertEquals(1, sweeper.leftAloneCount());
+		assertEquals(GAME, os.threads.get(11L), "other threads unaffected");
+		sweeper.configChanged();
+		sweeper.sweepOnce();
+		assertEquals(GAME, os.threads.get(10L), "a config change gives it another chance");
+		assertEquals(0, sweeper.leftAloneCount());
+	}
+
+	@Test
+	void changingOurOwnMindIsNotAThreadFightingBack() {
+		FakeBackend os = new FakeBackend();
+		os.addThread(30, ALL, "Worker-Main-3");
+		DhAffinity core = DhAffinity.createDetached(os, TestConfigs.split());
+		AffinitySweeper sweeper = core.createSweeperForTest();
+		for (int i = 0; i < AffinitySweeper.STICKY_LIMIT * 2; i++) {
+			core.setLocalWorld(i % 2 == 0); // join/leave servers many times
+			sweeper.sweepOnce();
+		}
+		core.setLocalWorld(true);
+		sweeper.sweepOnce();
+		assertEquals(DH, os.threads.get(30L), "still managed after many world switches");
+		assertEquals(0, sweeper.leftAloneCount());
+
+		// And a thread that is corrected only now and then (not on consecutive sweeps) is never abandoned.
+		FakeBackend os2 = new FakeBackend();
+		os2.addThread(10, ALL);
+		DhAffinity core2 = DhAffinity.createDetached(os2, TestConfigs.split());
+		AffinitySweeper sweeper2 = core2.createSweeperForTest();
+		for (int i = 0; i < AffinitySweeper.STICKY_LIMIT * 3; i++) {
+			if (i % 2 == 0) {
+				os2.threads.put(10L, ALL); // reset every other sweep
+			}
+			sweeper2.sweepOnce();
+		}
+		assertEquals(0, sweeper2.leftAloneCount());
+		assertEquals(GAME, os2.threads.get(10L));
+	}
+
+	@Test
 	void chunkGenerationIsNotAppliedWhenNonDhThreadsAreUnmanaged() {
 		FakeBackend os = new FakeBackend();
 		os.addThread(30, ALL, "Worker-Main-3");

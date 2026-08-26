@@ -22,10 +22,14 @@ public final class FrameStats {
 	static final long SEVERE_NANOS = 50_000_000L;
 	static final double HITCH_FACTOR = 2.5;
 	static final double SEVERE_FACTOR = 4.0;
+	/** A "spike" is what a frametime graph shows as a blip: well above the average, but not necessarily a full hitch. */
+	static final long SPIKE_NANOS = 8_000_000L;
+	static final double SPIKE_FACTOR = 2.0;
 	private static final double AVG_ALPHA = 0.05;
 
 	private final int[] frames = new int[BUCKETS];
 	private final int[] hitches = new int[BUCKETS];
+	private final int[] spikes = new int[BUCKETS];
 	private final int[] severe = new int[BUCKETS];
 	private final long[] worstNanos = new long[BUCKETS];
 	private final long[] gcCount = new long[BUCKETS];
@@ -41,9 +45,9 @@ public final class FrameStats {
 	private volatile boolean registered;
 	private final List<FrameListener> listeners = new java.util.concurrent.CopyOnWriteArrayList<>();
 
-	/** Notified at the end of every frame with its span and hitch classification. */
+	/** Notified at the end of every frame with its span and whether it was a spike (>2x avg, >8 ms). */
 	public interface FrameListener {
-		void onFrame(long startNanos, long endNanos, boolean hitch);
+		void onFrame(long startNanos, long endNanos, boolean spike);
 	}
 
 	public void addListener(FrameListener listener) {
@@ -73,6 +77,7 @@ public final class FrameStats {
 			bucketSecond[b] = second;
 			frames[b] = 0;
 			hitches[b] = 0;
+			spikes[b] = 0;
 			severe[b] = 0;
 			worstNanos[b] = 0;
 			gcCount[b] = 0;
@@ -85,9 +90,12 @@ public final class FrameStats {
 			if (delta < 5_000_000_000L) {
 				frames[b]++;
 				double avg = avgFrameNanos == 0 ? delta : avgFrameNanos;
+				if (delta > Math.max(SPIKE_NANOS, avg * SPIKE_FACTOR)) {
+					spikes[b]++;
+					hitchFrame = true; // listeners (the profiler) attribute spikes, not only full hitches
+				}
 				if (delta > Math.max(HITCH_NANOS, avg * HITCH_FACTOR)) {
 					hitches[b]++;
-					hitchFrame = true;
 				}
 				if (delta > Math.max(SEVERE_NANOS, avg * SEVERE_FACTOR)) {
 					severe[b]++;
@@ -96,6 +104,8 @@ public final class FrameStats {
 					worstNanos[b] = delta;
 				}
 				if (delta <= Math.max(HITCH_NANOS, avg * HITCH_FACTOR)) {
+					// Learn the pace from everything short of a full hitch: a sustained slower regime (shaders,
+					// heavy load-in) is learned within a few dozen frames instead of counting as endless spikes.
 					avgFrameNanos = avgFrameNanos == 0 ? delta : avgFrameNanos + AVG_ALPHA * (delta - avgFrameNanos);
 				}
 			}
@@ -160,6 +170,7 @@ public final class FrameStats {
 		long nowSecond = nowNanos / 1_000_000_000L;
 		int f = 0;
 		int h = 0;
+		int sp = 0;
 		int s = 0;
 		long worst = 0;
 		long gcs = 0;
@@ -172,16 +183,17 @@ public final class FrameStats {
 			seconds++;
 			f += frames[i];
 			h += hitches[i];
+			sp += spikes[i];
 			s += severe[i];
 			worst = Math.max(worst, worstNanos[i]);
 			gcs += gcCount[i];
 			gcMs += gcMillis[i];
 		}
-		return new Summary(f, h, s, worst / 1_000_000.0, gcs, gcMs, seconds);
+		return new Summary(f, h, sp, s, worst / 1_000_000.0, gcs, gcMs, seconds);
 	}
 
 	/** Last-60-second numbers; {@code seconds} = how many one-second buckets hold data. */
-	public record Summary(int frames, int hitches, int severe, double worstMs, long gcCollections, long gcMillis, int seconds) {
+	public record Summary(int frames, int hitches, int spikes, int severe, double worstMs, long gcCollections, long gcMillis, int seconds) {
 		public double fps() {
 			return seconds == 0 ? 0 : frames / (double) seconds;
 		}
@@ -197,7 +209,8 @@ public final class FrameStats {
 		if (s.frames() == 0) {
 			lines.add("Frames (last 60 s): none rendered in a world yet");
 		} else {
-			lines.add("Frames (last " + s.seconds() + " s): " + s.frames() + " (~" + String.format("%.1f", s.fps()) + " fps) | hitches (>2.5x avg, >33 ms): " + s.hitches()
+			lines.add("Frames (last " + s.seconds() + " s): " + s.frames() + " (~" + String.format("%.1f", s.fps()) + " fps) | spikes (>2x avg, >8 ms): " + s.spikes()
+					+ " | hitches (>2.5x avg, >33 ms): " + s.hitches()
 					+ ", severe (>4x avg, >50 ms): " + s.severe() + " | avg frame " + String.format("%.1f", avgFrameNanos / 1_000_000.0)
 					+ " ms, worst " + String.format("%.1f", s.worstMs()) + " ms");
 		}

@@ -78,7 +78,8 @@ Threads are recognised by name, so this needs no other mod and works with plain 
   the game on purpose.
 * `/dhaffinity status` prints `Chunk generation -> CPUs … | matched N threads (Worker-Main x15,
   c2me-worker x18)`, so you can see the patterns working. The group is only applied while
-  *Manage non-DH threads* is on.
+  *Manage non-DH threads* is on, and only in singleplayer / LAN-host worlds — on a remote server those
+  threads do no terrain generation, so they stay with the game (since 1.0.2).
 
 Upgrading from 1.0.0: this is on by default. To keep the old behaviour, open the menu, untick
 *Same as Distant Horizons* on the new row and select the game cores.
@@ -157,43 +158,17 @@ nothing is separated until you choose cores in the menu):
 Masks that name CPUs the machine does not have are trimmed with a warning; a group that would end
 up empty falls back to all CPUs (the log and `/dhaffinity status` say so). Overlaps are fine.
 
-## Hitches while exploring: off-thread GPU upload (experimental)
+## Off-thread GPU upload (experimental, OFF by default since 1.0.2)
 
-Affinity fixes *where* threads run, but one DH job is tied to the render thread by OpenGL's
-rules: copying finished LOD meshes into GPU memory. DH queues those copies and the render thread
-works through them between frames with a time budget of half a frame; when 16 cores finish a
-burst of terrain at once that budget is blown and you see a hitch.
-
-With `offThreadGpuUpload` (default on) the mod creates a hidden OpenGL context that shares
-objects with Minecraft's, runs a dedicated `DH-GPU Upload` thread on it, and diverts DH's buffer
-*creation and upload* tasks there. After every upload the thread waits for the GPU to finish
-before DH marks the buffer usable, so the render thread only ever draws complete buffers. Buffer
-deletion and everything else (shaders, framebuffers, screen updates) stays on the render thread,
-between frames, exactly where it was — deletes are cheap, and moving them would blank a section
-for a frame. If the
-context cannot be created, or the upload thread runs into OpenGL errors, the feature switches
-itself off and DH's normal path takes over — `/dhaffinity status` shows which.
-
-The upload thread appears as its own pool ("GPU Upload") in the menu's Advanced section, so you
-can pin it like any other DH pool (it follows the Distant Horizons group by default).
-
-**Hand-over pacing (`uploadPacing`).** With DH on dedicated cores it finishes terrain far faster
-than before, and every section that becomes visible costs the render thread and the GPU
-something in the frame it appears — a burst of finished sections is a hitch even when the copies
-are off-thread. The upload thread therefore meters how many sections are handed to the renderer
-per frame. `auto` (default) adapts like a network congestion controller: the limit grows while
-frames are smooth and halves when frames hitch (only if DH actually published sections in the
-last few frames, so unrelated stutter does not throttle DH forever). `off` hands everything over
-immediately; a number fixes the limit. `/dhaffinity status` shows the live budget. It is a
-trade-off, not magic: during heavy load-in either frames or terrain arrival latency pays, and
-auto looks for the fastest rate that stays smooth.
-
-**If LODs flicker or look corrupted with it on, turn it off** (menu → Advanced → "Off-thread GPU
-upload", or `"offThreadGpuUpload": false`) and include your GPU/driver in a bug report.
-
-When uploads are *not* off-loaded, `renderThreadTaskBudgetMs` caps how long the render thread
-may spend on DH's GL tasks per frame (0 = DH's default of half a frame; 2–4 ms spreads a burst
-over several frames).
+1.0.0 uploaded Distant Horizons' finished LOD buffers on a dedicated thread with a second OpenGL
+context sharing Minecraft's, with adaptive pacing. It measured well in the render-thread profiler, but the design is a known
+cost: on NVIDIA a second shared context carries a per-frame tax and serialises driver work against
+the render thread (Sodium's NVIDIA workaround makes every such wait show up inside
+the render thread's own GL calls). Distant Horizons' developers built and removed the same design.
+Since 1.0.2 it is off by default and DH's normal render-thread upload path is used; the checkbox
+"Off-thread GPU upload (experimental)" turns it back on for experiments, with "Hand-over pacing"
+(Auto / Off / N sections per frame) limiting how many finished sections are handed over per frame.
+Existing 1.0.0/1.0.1 configs are migrated once (`configVersion`); a choice made afterwards is kept.
 
 ## The lock nobody saw: DH's keyed-level lookup
 
@@ -233,6 +208,13 @@ If you prefer to keep G1, at least size its threads for the game cores instead o
 ```
 -Xms8G -Xmx8G -XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:ParallelGCThreads=12 -XX:ConcGCThreads=3
 ```
+
+## Reading the numbers
+
+`/dhaffinity status` reports **spikes** (frames over 2x the running average and over 8 ms — what a
+frametime graph shows as a blip) separately from **hitches** (>2.5x and >33 ms). Judge changes by
+spikes, average and worst frame, not by hitch count alone; `/dhaffinity profile <seconds>` attributes
+spike frames to whatever the render thread was doing.
 
 ## In-game commands
 

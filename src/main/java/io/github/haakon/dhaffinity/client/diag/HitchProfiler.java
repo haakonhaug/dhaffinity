@@ -199,6 +199,18 @@ public final class HitchProfiler implements FrameStats.FrameListener {
 			}
 		}
 		String category = ownerCategory(owner.getClassName());
+		if (category.equals(DH_TASKS) || category.equals(DH_RENDERING) || category.equals("DH other")) {
+			// DH's draw loop and its queued GL tasks share the same buffer classes; only the task drain is
+			// "DH GL tasks", everything else under a DH class in the frame is drawing.
+			boolean inTaskDrain = false;
+			for (StackTraceElement e : stack) {
+				if (e.getClassName().contains("RenderThreadTaskHandler")) {
+					inTaskDrain = true;
+					break;
+				}
+			}
+			category = inTaskDrain ? DH_TASKS : category.equals(DH_TASKS) ? DH_RENDERING : category;
+		}
 		if (glCall != null) {
 			category = "OpenGL driver call inside " + category;
 		}
@@ -212,13 +224,16 @@ public final class HitchProfiler implements FrameStats.FrameListener {
 	}
 
 	/** Coarse owner buckets; vanilla classes are matched by their runtime (intermediary) names. */
+	static final String DH_TASKS = "DH GL tasks on render thread (buffer create/delete)";
+	static final String DH_RENDERING = "DH rendering (draw calls)";
+
 	static String ownerCategory(String cls) {
 		if (cls.startsWith("com.seibel.distanthorizons")) {
-			if (cls.contains("RenderThreadTaskHandler") || cls.contains("glObject")) {
-				return "DH GL tasks on render thread (buffer create/delete)";
+			if (cls.contains("RenderThreadTaskHandler")) {
+				return DH_TASKS;
 			}
-			if (cls.contains(".render") || cls.contains("Render")) {
-				return "DH rendering";
+			if (cls.contains("glObject") || cls.contains(".render") || cls.contains("Render")) {
+				return DH_RENDERING;
 			}
 			return "DH other";
 		}
@@ -273,12 +288,12 @@ public final class HitchProfiler implements FrameStats.FrameListener {
 
 	private List<String> buildReport() {
 		List<String> lines = new ArrayList<>();
-		lines.add(String.format(Locale.ROOT, "Render-thread profile: %d frames, %d hitch frames, %d samples inside hitches, %d outside.",
+		lines.add(String.format(Locale.ROOT, "Render-thread profile: %d frames, %d spike frames (>2x avg, >8 ms), %d samples inside spikes, %d outside.",
 				frames, hitchFrames, samplesInHitches, samplesOutside));
 		if (samplesInHitches == 0) {
-			lines.add("No samples fell inside hitch frames — either no hitches happened or the sampler could not keep up.");
+			lines.add("No samples fell inside spike frames — either no spikes happened or the sampler could not keep up.");
 		} else {
-			lines.add("Inside hitches the render thread was in:");
+			lines.add("Inside spike frames the render thread was in:");
 			List<Map.Entry<String, Integer>> sorted = new ArrayList<>(hitchCategories.entrySet());
 			sorted.sort(Comparator.comparingInt((Map.Entry<String, Integer> e) -> e.getValue()).reversed());
 			int shown = 0;

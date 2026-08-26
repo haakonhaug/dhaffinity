@@ -57,6 +57,7 @@ public final class DhAffinity {
 	private volatile AffinityConfig config;
 	private volatile AffinitySweeper sweeper;
 	private volatile long mainThreadTid;
+	private volatile boolean localWorld = true;
 	private volatile boolean started;
 	private volatile String vanillaWorkerCap = "";
 	private final Object logLock = new Object();
@@ -326,7 +327,8 @@ public final class DhAffinity {
 					+ " | corrected " + st.lastCorrected() + " | unchanged " + st.lastUnchanged()
 					+ " | skipped " + st.lastSkipped() + " | gone " + st.lastGone() + " | failed " + st.lastFailed()
 					+ " | " + formatMicros(st.lastDurationMicros()) + " wall (max " + formatMicros(st.maxDurationMicros()) + ")"
-					+ " | interval " + s.currentIntervalMs() + " ms");
+					+ " | interval " + s.currentIntervalMs() + " ms"
+					+ (s.leftAloneCount() > 0 ? " | left alone (kept moving back): " + s.leftAloneCount() : ""));
 			lines.add("Totals: corrected " + st.totalCorrected() + " | failed " + st.totalFailed()
 					+ " | process-mask resets " + st.processMaskResets());
 		}
@@ -335,6 +337,8 @@ public final class DhAffinity {
 					.append(" | patterns ").append(cfg.chunkGenPatternTexts);
 			if (!cfg.manageNonDhThreads) {
 				sb.append(" | NOT applied (non-DH threads are not managed)");
+			} else if (!localWorld) {
+				sb.append(" | inactive: remote server (applied only with a local world)");
 			} else if (s == null) {
 				sb.append(" | matched: sweeper not running");
 			} else {
@@ -415,6 +419,27 @@ public final class DhAffinity {
 
 	public AffinitySweeper sweeper() {
 		return sweeper;
+	}
+
+	/** Whether the current world runs on the integrated server (singleplayer / LAN host). */
+	public boolean localWorld() {
+		return localWorld;
+	}
+
+	/**
+	 * Set by the client on world join/leave. The chunk-generation thread group only applies with a local
+	 * world: on a remote server those threads do no terrain generation, so moving them buys nothing.
+	 */
+	public void setLocalWorld(boolean local) {
+		if (localWorld != local) {
+			localWorld = local;
+			AffinitySweeper s = sweeper;
+			if (s != null) {
+				// The chunk-generation threads legitimately move now; a config-style reset keeps that from
+				// counting against them as "moving themselves back".
+				s.configChanged();
+			}
+		}
 	}
 
 	/** Native ID of the main/render thread (captured at preLaunch), or 0 if unknown. */

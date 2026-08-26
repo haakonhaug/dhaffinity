@@ -11,8 +11,10 @@ package io.github.haakon.dhaffinity.client.gpu;
  * not throttle DH forever. When no frames are being rendered there is nothing to protect and the
  * pacer lets everything through.
  *
- * <p>GL-free and thread-safe: the render thread calls {@link #onFrame(long)}, the upload thread
- * calls {@link #tryAdmit(long)}; the worker waits on its own monitor, which the frame tick notifies.
+ * <p>Lock-free by construction: the render thread is the only writer of the frame-side state
+ * ({@link #onFrame(long)}), the upload thread the only writer of the admission-side state
+ * ({@link #tryAdmit(long)}); the two sides exchange a handful of volatile fields. Nothing here can
+ * park the render thread behind another thread, whatever cores that thread runs on.
  */
 public final class UploadPacer {
 
@@ -31,40 +33,66 @@ public final class UploadPacer {
 	static final long CLOCK_STALE_NANOS = 1_000_000_000L;
 	private static final double AVG_ALPHA = 0.05;
 
-	private Mode mode = Mode.AUTO;
-	private int fixedBudget = 4;
+	// Configuration: written from any thread (config change), read by both sides.
+	private volatile Mode mode = Mode.AUTO;
+	private volatile int fixedBudget = 4;
+	private volatile boolean resetRequested;
+
+	// Render-thread state (single writer: onFrame).
 	private double budget = INITIAL_BUDGET;
-	private int admittedThisFrame;
-	private boolean deniedThisFrame;
-	private long lastTickNanos;
+	private long lastTick;
 	private double avgFrameNanos;
 	private int cleanStreak;
 	private final boolean[] hitchHistory = new boolean[HISTORY];
-	private final int[] admittedHistory = new int[HISTORY];
 	private int historyIndex;
-	private long totalAdmitted;
-	private long totalDelays;
-	private long backoffs;
-	private long increases;
 
-	/** Idempotent: called on every diverted task with the current config; only a real change resets the controller. */
-	public synchronized void configure(Mode mode, int fixedBudget) {
+	// Published render thread -> upload thread. allowance is written before frameSeq so a reader that
+	// sees the new frame also sees its allowance.
+	private volatile int allowance = (int) INITIAL_BUDGET;
+	private volatile long frameSeq;
+	private volatile long lastTickNanos;
+
+	// Upload-thread state (single writer: tryAdmit).
+	private long admittedFrameSeq = -1;
+	private int admittedThisFrame;
+	private boolean deniedThisFrame;
+
+	// Published for the other side / status (each has exactly one writer).
+	private volatile long lastAdmittedFrameSeq = -1; // -1 = never
+	private volatile long totalAdmitted;
+	private volatile long totalDelays;
+	private volatile long backoffs;
+	private volatile long increases;
+	private volatile double publishedBudget = INITIAL_BUDGET;
+	private volatile double publishedAvgNanos;
+
+	/** Idempotent; only a real change resets the controller (applied on the next frame tick). */
+	public void configure(Mode mode, int fixedBudget) {
 		int wanted = mode == Mode.FIXED ? Math.max(FLOOR, Math.min(CAP, fixedBudget)) : this.fixedBudget;
 		if (this.mode == mode && this.fixedBudget == wanted) {
 			return;
 		}
-		this.mode = mode;
 		this.fixedBudget = wanted;
+		this.mode = mode;
 		if (mode == Mode.AUTO) {
-			budget = INITIAL_BUDGET;
-			cleanStreak = 0;
+			// The render thread applies the reset to its private state on the next tick; publish the
+			// reset value right away so budget()/tryAdmit see it immediately.
+			resetRequested = true;
+			publishedBudget = INITIAL_BUDGET;
+			allowance = (int) INITIAL_BUDGET;
 		}
 	}
 
-	/** Render-thread frame tick: adapt the budget and open the next frame's allowance. */
-	public synchronized void onFrame(long nowNanos) {
-		if (lastTickNanos != 0) {
-			long delta = nowNanos - lastTickNanos;
+	/** Render-thread frame tick: adapt the budget and open the next frame's allowance. Never blocks. */
+	public void onFrame(long nowNanos) {
+		if (resetRequested) {
+			resetRequested = false;
+			budget = INITIAL_BUDGET;
+			cleanStreak = 0;
+		}
+		long seq = frameSeq;
+		if (lastTick != 0) {
+			long delta = nowNanos - lastTick;
 			// A gap longer than the stale threshold is a clock restart (menu, loading), not a frame.
 			if (delta > 0 && delta <= CLOCK_STALE_NANOS) {
 				double avg = avgFrameNanos == 0 ? delta : avgFrameNanos;
@@ -74,32 +102,34 @@ public final class UploadPacer {
 					// the threshold until it looks normal.
 					avgFrameNanos = avgFrameNanos == 0 ? delta : avgFrameNanos + AVG_ALPHA * (delta - avgFrameNanos);
 				}
-				record(hitch);
+				long lastAdmitted = lastAdmittedFrameSeq;
+				boolean admittedRecently = lastAdmitted >= 0 && seq - lastAdmitted < HISTORY;
+				record(hitch, admittedRecently);
 			}
 		}
+		lastTick = nowNanos;
+		publishedBudget = budget;
+		publishedAvgNanos = avgFrameNanos;
+		allowance = (int) Math.max(FLOOR, Math.floor(budget));
 		lastTickNanos = nowNanos;
-		admittedThisFrame = 0;
-		deniedThisFrame = false;
+		frameSeq = seq + 1;
 	}
 
-	private void record(boolean hitch) {
+	private void record(boolean hitch, boolean admittedRecently) {
 		hitchHistory[historyIndex] = hitch;
 		historyIndex = (historyIndex + 1) % HISTORY;
-		admittedHistory[historyIndex] = 0; // the slot the coming frame will count into
 		if (mode != Mode.AUTO) {
 			return;
 		}
 		int hitches = 0;
-		int admitted = 0;
 		for (int i = 0; i < HISTORY; i++) {
 			if (hitchHistory[i]) {
 				hitches++;
 			}
-			admitted += admittedHistory[i];
 		}
 		if (hitch) {
 			cleanStreak = 0;
-			if (hitches >= HITCHES_FOR_DECREASE && admitted > 0) {
+			if (hitches >= HITCHES_FOR_DECREASE && admittedRecently) {
 				double next = Math.max(FLOOR, budget / 2);
 				if (next < budget) {
 					budget = next;
@@ -117,14 +147,22 @@ public final class UploadPacer {
 		}
 	}
 
-	/** May one more section be handed over in this frame? Records the admission when yes. */
-	public synchronized boolean tryAdmit(long nowNanos) {
-		if (mode == Mode.OFF || lastTickNanos == 0 || nowNanos - lastTickNanos > CLOCK_STALE_NANOS) {
+	/** Upload thread: may one more section be handed over in this frame? Records the admission when yes. */
+	public boolean tryAdmit(long nowNanos) {
+		Mode m = mode;
+		long tick = lastTickNanos;
+		if (m == Mode.OFF || tick == 0 || nowNanos - tick > CLOCK_STALE_NANOS) {
 			totalAdmitted++;
 			return true; // nothing is being rendered, or pacing is off
 		}
-		int allowance = mode == Mode.FIXED ? fixedBudget : (int) Math.max(FLOOR, Math.floor(budget));
-		if (admittedThisFrame >= allowance) {
+		long seq = frameSeq;
+		if (seq != admittedFrameSeq) {
+			admittedFrameSeq = seq;
+			admittedThisFrame = 0;
+			deniedThisFrame = false;
+		}
+		int allow = m == Mode.FIXED ? Math.max(FLOOR, Math.min(CAP, fixedBudget)) : allowance;
+		if (admittedThisFrame >= allow) {
 			if (!deniedThisFrame) {
 				deniedThisFrame = true;
 				totalDelays++; // once per frame in which the budget held something back
@@ -132,42 +170,44 @@ public final class UploadPacer {
 			return false;
 		}
 		admittedThisFrame++;
-		admittedHistory[historyIndex] = admittedHistory[historyIndex] + 1;
+		lastAdmittedFrameSeq = seq;
 		totalAdmitted++;
 		return true;
 	}
 
-	public synchronized double budget() {
-		return mode == Mode.FIXED ? fixedBudget : budget;
+	public double budget() {
+		return mode == Mode.FIXED ? fixedBudget : publishedBudget;
 	}
 
-	public synchronized Mode mode() {
+	public Mode mode() {
 		return mode;
 	}
 
-	public synchronized String describe() {
-		if (mode == Mode.OFF) {
+	public String describe() {
+		Mode m = mode;
+		if (m == Mode.OFF) {
 			return "off (sections are handed over as soon as they are ready)";
 		}
-		StringBuilder sb = new StringBuilder(mode == Mode.AUTO ? "auto" : "fixed");
-		sb.append(" — budget ").append(mode == Mode.FIXED ? fixedBudget : (int) Math.floor(budget)).append(" sections/frame");
-		if (mode == Mode.AUTO) {
+		StringBuilder sb = new StringBuilder(m == Mode.AUTO ? "auto" : "fixed");
+		sb.append(" — budget ").append(m == Mode.FIXED ? fixedBudget : (int) Math.floor(publishedBudget)).append(" sections/frame");
+		if (m == Mode.AUTO) {
 			sb.append(" (backoffs ").append(backoffs).append(", increases ").append(increases).append(", avg frame ")
-					.append(String.format("%.1f", avgFrameNanos / 1_000_000.0)).append(" ms)");
+					.append(String.format("%.1f", publishedAvgNanos / 1_000_000.0)).append(" ms)");
 		}
 		sb.append(" | admitted ").append(totalAdmitted).append(", frames at limit ").append(totalDelays);
-		if (lastTickNanos == 0 || System.nanoTime() - lastTickNanos > CLOCK_STALE_NANOS) {
+		long tick = lastTickNanos;
+		if (tick == 0 || System.nanoTime() - tick > CLOCK_STALE_NANOS) {
 			sb.append(" | frame clock idle (not pacing)");
 		}
 		return sb.toString();
 	}
 
 	// Test hooks
-	synchronized long backoffs() {
+	long backoffs() {
 		return backoffs;
 	}
 
-	synchronized long increases() {
+	long increases() {
 		return increases;
 	}
 }

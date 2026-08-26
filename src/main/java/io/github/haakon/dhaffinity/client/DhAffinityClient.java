@@ -44,6 +44,9 @@ public final class DhAffinityClient implements ClientModInitializer {
 			};
 			FrameStats.INSTANCE.addListener(once[0]);
 		}
+		// The chunk-generation group only applies with a local (integrated-server) world; the flag is
+		// cheap to refresh every tick and setLocalWorld only reacts to changes.
+		ClientTickEvents.END_CLIENT_TICK.register(client -> DhAffinity.get().setLocalWorld(client.level == null || client.isLocalServer()));
 		if (STATUS_LOG_SECONDS > 0) {
 			int[] ticks = {0};
 			ClientTickEvents.END_CLIENT_TICK.register(client -> {

@@ -16,6 +16,10 @@ import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL30;
 import org.lwjgl.opengl.GL32;
 import org.lwjgl.system.MemoryUtil;
+
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
 import org.slf4j.Logger;
 
 import java.util.ArrayList;
@@ -80,15 +84,31 @@ public final class GpuUploadWorker {
 	private volatile boolean shutdownHooked;
 	/** Incremented after every worker task; read by the render thread each frame (happens-before edge). */
 	private volatile long completedSequence;
+	/** The config instance the offloader/pacer were last configured from; re-read only when it changes. */
+	private final AtomicReference<AffinityConfig> lastConfigured = new AtomicReference<>();
+	/** Queue size mirror so status never takes {@link #lock} on the render thread. */
+	private final AtomicInteger queued = new AtomicInteger();
+	/** Idle sleep between polls when nothing is admitted; a producer or the frame tick unparks earlier. */
+	private static final long PARK_NANOS = 2_000_000L;
+	/** GL_DEBUG_OUTPUT_SYNCHRONOUS: Sodium enables it on Minecraft's context as an NVIDIA workaround; mirror it here. */
+	private static final int GL_DEBUG_OUTPUT_SYNCHRONOUS = 0x8242;
 
 	private GpuUploadWorker() {}
 
 	/** Mixin entry point: take the task if it should run on the upload thread. */
 	public boolean tryRedirect(String name, Runnable task) {
 		AffinityConfig cfg = DhAffinity.get().config();
-		offloader.setEnabled(cfg.enabled && cfg.offThreadGpuUpload);
-		pacer.configure(cfg.uploadPacing.equals("off") ? UploadPacer.Mode.OFF : cfg.uploadPacingFixed > 0 ? UploadPacer.Mode.FIXED : UploadPacer.Mode.AUTO,
-				cfg.uploadPacingFixed);
+		AffinityConfig seen = lastConfigured.get();
+		if (cfg != seen && lastConfigured.compareAndSet(seen, cfg)) {
+			// Reconfigure only when the config object changed (save/reload), not on every DH submission:
+			// this is the hot path from DH's worker threads. Re-read after winning the race so a thread
+			// holding an older object never re-applies stale settings over newer ones.
+			cfg = DhAffinity.get().config();
+			lastConfigured.set(cfg);
+			offloader.setEnabled(cfg.enabled && cfg.offThreadGpuUpload);
+			pacer.configure(cfg.uploadPacing.equals("off") ? UploadPacer.Mode.OFF : cfg.uploadPacingFixed > 0 ? UploadPacer.Mode.FIXED : UploadPacer.Mode.AUTO,
+					cfg.uploadPacingFixed);
+		}
 		if (task == null || !offloader.shouldRedirect(name, this::requestStart)) {
 			return false;
 		}
@@ -105,12 +125,21 @@ public final class GpuUploadWorker {
 			}
 			(SETUP_TASK.equals(name) ? setups : ready).add(entry);
 			int size = ready.size() + setups.size();
+			queued.set(size);
 			if (size > queueHighWater) {
 				queueHighWater = size;
 			}
-			lock.notifyAll();
 		}
+		wake();
 		return true;
+	}
+
+	/** Wake the worker without taking any monitor (safe from the render thread and from DH's workers). */
+	private void wake() {
+		Thread t = thread;
+		if (t != null) {
+			LockSupport.unpark(t);
+		}
 	}
 
 	/** Render-thread task budget to enforce while uploads are NOT off-loaded; 0 = leave DH's default. */
@@ -214,6 +243,11 @@ public final class GpuUploadWorker {
 		try {
 			GLFW.glfwMakeContextCurrent(windowHandle);
 			GL.createCapabilities();
+			if (GL.getCapabilities().GL_KHR_debug) {
+				// Sodium forces synchronous debug output on Minecraft's context to disable NVIDIA's threaded
+				// optimisation; a shared context without it would get the driver's extra worker thread back.
+				GL11.glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+			}
 			// Core profile: element-array-buffer binds are VAO state and need a VAO bound; DH's upload code
 			// saves and restores whatever VAO is current, so a private one keeps strict drivers happy.
 			int vao = GL30.glGenVertexArrays();
@@ -243,23 +277,23 @@ public final class GpuUploadWorker {
 		try {
 			while (true) {
 				Task task;
+				boolean stop = false;
 				synchronized (lock) {
-					while (true) {
-						task = ready.poll();
-						if (task != null) {
-							break;
-						}
+					task = ready.poll();
+					if (task == null && !setups.isEmpty() && pacer.tryAdmit(System.nanoTime())) {
 						// Nothing else to do: admit one section's Setup if the pacer allows it this frame.
 						// Uploads always go first so admitted sections finish (and appear) before more start.
-						if (!setups.isEmpty() && pacer.tryAdmit(System.nanoTime())) {
-							task = setups.poll();
-							break;
-						}
-						if (!accepting) {
-							break;
-						}
-						lock.wait(100); // new task or frame tick wakes us; the timeout keeps us fail-open
+						task = setups.poll();
 					}
+					if (task == null && !accepting) {
+						stop = true;
+					}
+					queued.set(ready.size() + setups.size());
+				}
+				if (task == null && !stop) {
+					// Sleep until a producer or the frame tick unparks us; bounded so we stay fail-open.
+					LockSupport.parkNanos(this, PARK_NANOS);
+					continue;
 				}
 				if (task == null || task == POISON) {
 					handBackQueuedTasks();
@@ -301,8 +335,6 @@ public final class GpuUploadWorker {
 					return;
 				}
 			}
-		} catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
 		} finally {
 			contextReady = false;
 			if (offloader.state() != GpuUploadOffloader.State.FAILED) {
@@ -334,8 +366,8 @@ public final class GpuUploadWorker {
 		synchronized (lock) {
 			accepting = false;
 			ready.add(POISON);
-			lock.notifyAll();
 		}
+		wake();
 		try {
 			worker.join(1_500);
 		} catch (InterruptedException e) {
@@ -364,8 +396,9 @@ public final class GpuUploadWorker {
 			pending.addAll(setups);
 			ready.clear();
 			setups.clear();
-			lock.notifyAll();
+			queued.set(0);
 		}
+		wake();
 		int count = 0;
 		for (Task task : pending) {
 			if (task != POISON) {
@@ -394,9 +427,7 @@ public final class GpuUploadWorker {
 		long ignored = completedSequence;
 		if (offloader.state() == GpuUploadOffloader.State.READY) {
 			pacer.onFrame(System.nanoTime());
-			synchronized (lock) {
-				lock.notifyAll();
-			}
+			wake(); // never a monitor here: DH's workers must not be able to park the render thread
 		}
 	}
 
@@ -464,9 +495,7 @@ public final class GpuUploadWorker {
 	}
 
 	private int queuedCount() {
-		synchronized (lock) {
-			return ready.size() + setups.size();
-		}
+		return queued.get();
 	}
 
 	public List<String> statusLines() {

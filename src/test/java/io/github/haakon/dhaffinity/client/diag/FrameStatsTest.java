@@ -42,6 +42,45 @@ class FrameStatsTest {
 		assertEquals(2, sum.hitches());
 		assertEquals(1, sum.severe());
 		assertEquals(80.0, sum.worstMs(), 0.01);
+		assertEquals(2, sum.spikes(), "both slow frames are spikes too");
+	}
+
+	@Test
+	void spikesCatchWhatAFrametimeGraphShows() throws Exception {
+		FrameStats s = fresh();
+		long t = 10_000_000_000L;
+		frame(s, t);
+		for (int i = 0; i < 100; i++) {
+			t += 12_000_000L; // ~83 fps, a fast machine
+			frame(s, t);
+		}
+		t += 28_000_000L; // 28 ms: a clear blip on the graph, but under the 33 ms hitch floor
+		frame(s, t);
+		t += 27_000_000L; // 27 ms: still > 2x the (slightly raised) average
+		frame(s, t);
+		t += 15_000_000L; // 15 ms: not a spike (< 2x)
+		frame(s, t);
+		FrameStats.Summary sum = s.summary(t);
+		assertEquals(0, sum.hitches());
+		assertEquals(2, sum.spikes());
+	}
+
+	@Test
+	void aSustainedSlowerRegimeIsLearnedNotCountedAsEndlessSpikes() throws Exception {
+		FrameStats s = fresh();
+		long t = 10_000_000_000L;
+		frame(s, t);
+		for (int i = 0; i < 100; i++) {
+			t += 10_000_000L; // 100 fps
+			frame(s, t);
+		}
+		int spikesBefore = s.summary(t).spikes();
+		for (int i = 0; i < 100; i++) {
+			t += 24_000_000L; // shaders on: a steady 2.4x slower pace
+			frame(s, t);
+		}
+		int spikesDuring = s.summary(t).spikes() - spikesBefore;
+		assertTrue(spikesDuring < 40, "the new pace is learned within a few dozen frames, got " + spikesDuring + " spikes");
 	}
 
 	@Test

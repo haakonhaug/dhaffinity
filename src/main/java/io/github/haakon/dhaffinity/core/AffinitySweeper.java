@@ -6,6 +6,8 @@ import io.github.haakon.dhaffinity.config.AffinityConfig;
 import org.slf4j.Logger;
 
 import java.util.HashMap;
+import java.util.concurrent.locks.LockSupport;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.TreeMap;
 import java.util.Collections;
 import java.util.HashSet;
@@ -61,15 +63,22 @@ public final class AffinitySweeper implements Runnable {
 	private final DhAffinity core;
 	private final Logger log;
 	private final long startNanos = System.nanoTime();
-	private final Object wake = new Object();
 	/** TID → sweep number at which it may be retried. Sweeper thread only. */
 	private final Map<Long, Long> retryAtSweep = new HashMap<>();
 	private final Map<Long, Integer> failStreak = new HashMap<>();
+	/** How often each non-DH thread had to be re-pinned; a thread that keeps moving itself back is left alone. */
+	private final Map<Long, Integer> corrections = new HashMap<>();
+	private final Set<Long> leftAlone = new HashSet<>();
+	/** Mask the sweeper last wanted for each non-DH thread; a change of intent is not the thread "moving back". */
+	private final Map<Long, Long> lastDesired = new HashMap<>();
+	static final int STICKY_LIMIT = 8;
+	private volatile int leftAloneCount;
+	private int leftAloneLogs;
 	private volatile Stats stats = Stats.NONE;
 	private volatile boolean stopped;
 	/** Set when the config changes: threads that failed with the old mask must be offered the new one. */
 	private volatile boolean resetBackoff;
-	private boolean poked;
+	private final AtomicBoolean poked = new AtomicBoolean();
 	private boolean warnedProcessMask;
 	private boolean warnedNoThreads;
 	private int failureLogs;
@@ -103,9 +112,11 @@ public final class AffinitySweeper implements Runnable {
 
 	/** Ask for a sweep as soon as possible instead of waiting for the next interval. */
 	public void poke() {
-		synchronized (wake) {
-			poked = true;
-			wake.notifyAll();
+		// No monitor: callers include the render thread (config save, world join); unpark cannot block.
+		poked.set(true);
+		Thread t = thread;
+		if (t != null) {
+			LockSupport.unpark(t);
 		}
 	}
 
@@ -156,15 +167,9 @@ public final class AffinitySweeper implements Runnable {
 				}
 			}
 			long interval = currentIntervalMs();
-			synchronized (wake) {
-				if (!poked && !stopped) {
-					try {
-						wake.wait(interval);
-					} catch (InterruptedException e) {
-						return;
-					}
-				}
-				poked = false;
+			if (!poked.getAndSet(false) && !stopped) {
+				LockSupport.parkNanos(this, interval * 1_000_000L); // a poke unparks us early
+				poked.set(false);
 			}
 		}
 	}
@@ -190,6 +195,9 @@ public final class AffinitySweeper implements Runnable {
 			resetBackoff = false;
 			retryAtSweep.clear();
 			failStreak.clear();
+			corrections.clear();
+			leftAlone.clear();
+			leftAloneCount = 0;
 		}
 
 		reconcileProcessMask(cfg, backend);
@@ -233,7 +241,7 @@ public final class AffinitySweeper implements Runnable {
 		int dhSeen = 0;
 		int chunkGenSeen = 0;
 		Map<String, Integer> chunkGenNames = new TreeMap<>();
-		boolean chunkGen = cfg.chunkGenActive() && cfg.chunkGenMask != 0 && registryOnly == null;
+		boolean chunkGen = cfg.chunkGenActive() && cfg.chunkGenMask != 0 && registryOnly == null && core.localWorld();
 		long mainTid = core.mainThreadTid();
 		for (long tid : tids) {
 			ThreadRegistry.DhThread dh = registryOnly != null ? registryOnly.get(tid) : registry.get(tid);
@@ -266,6 +274,10 @@ public final class AffinitySweeper implements Runnable {
 				skipped++;
 				continue;
 			}
+			if (dh == null && leftAlone.contains(tid)) {
+				skipped++;
+				continue;
+			}
 			Long retryAt = retryAtSweep.get(tid);
 			if (retryAt != null && sweepNo < retryAt) {
 				skipped++;
@@ -287,10 +299,33 @@ public final class AffinitySweeper implements Runnable {
 				case UNCHANGED -> {
 					unchanged++;
 					clearFailure(tid);
+					if (dh == null && !corrections.isEmpty()) {
+						corrections.remove(tid); // "keeps moving back" means on consecutive sweeps
+					}
 				}
 				case CHANGED -> {
 					corrected++;
 					clearFailure(tid);
+					if (dh == null && tid != mainTid) {
+						Long wantedBefore = lastDesired.put(tid, desired);
+						boolean intentChanged = wantedBefore != null && wantedBefore != desired;
+						int count;
+						if (intentChanged) {
+							corrections.remove(tid); // we changed our mind (e.g. world type); that is not the thread fighting us
+							count = 0;
+						} else {
+							count = corrections.merge(tid, 1, Integer::sum);
+						}
+						if (count >= STICKY_LIMIT) {
+							// Something (a driver, the OS) keeps moving this thread back; fighting it every
+							// sweep only forces a core migration each time. Leave it where it wants to be.
+							leftAlone.add(tid);
+							leftAloneCount = leftAlone.size();
+							if (leftAloneLogs++ < 5) {
+								log.info("DH Affinity: thread {} keeps moving itself back ({} corrections); leaving it alone from now on.", tid, count);
+							}
+						}
+					}
 					if (cfg.logPins) {
 						log.info("DH Affinity: pinned thread {} -> {} (CPUs {}) [{}]", tid, MaskFormat.toHex(desired),
 								MaskFormat.toCpuList(desired), kind);
@@ -301,6 +336,11 @@ public final class AffinitySweeper implements Runnable {
 					clearFailure(tid);
 					synchronized (nameCache) {
 						nameCache.remove(tid);
+					}
+					corrections.remove(tid);
+					lastDesired.remove(tid);
+					if (leftAlone.remove(tid)) {
+						leftAloneCount = leftAlone.size();
 					}
 					if (dh != null && registryOnly != null) {
 						registry.unregisterIfSame(tid, dh);
@@ -321,13 +361,18 @@ public final class AffinitySweeper implements Runnable {
 			}
 		}
 
-		if (!retryAtSweep.isEmpty() || !nameCache.isEmpty()) {
+		if (!retryAtSweep.isEmpty() || !nameCache.isEmpty() || !corrections.isEmpty()) {
 			Set<Long> alive = new HashSet<>(tids.length * 2);
 			for (long tid : tids) {
 				alive.add(tid);
 			}
 			retryAtSweep.keySet().retainAll(alive);
 			failStreak.keySet().retainAll(alive);
+			corrections.keySet().retainAll(alive);
+			lastDesired.keySet().retainAll(alive);
+			if (leftAlone.retainAll(alive)) {
+				leftAloneCount = leftAlone.size();
+			}
 			synchronized (nameCache) {
 				nameCache.keySet().retainAll(alive);
 			}
@@ -358,6 +403,11 @@ public final class AffinitySweeper implements Runnable {
 			nameCache.put(tid, name == null ? "" : name);
 		}
 		return name;
+	}
+
+	/** Non-DH threads no longer re-pinned because they kept moving themselves back. */
+	public int leftAloneCount() {
+		return leftAloneCount;
 	}
 
 	/** Thread-name prefixes that matched the chunk-generation patterns in the last sweep, with counts. */
@@ -392,6 +442,9 @@ public final class AffinitySweeper implements Runnable {
 		// Widening resets every thread to the process mask (Windows semantics); retry previously failed threads.
 		retryAtSweep.clear();
 		failStreak.clear();
+		corrections.clear(); // every thread will legitimately need one correction now
+		leftAlone.clear();
+		leftAloneCount = 0;
 		if (!warnedProcessMask) {
 			warnedProcessMask = true;
 			log.warn("DH Affinity: the process affinity mask was {} (CPUs {}) instead of all CPUs ({}); {}. "

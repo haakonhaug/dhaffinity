@@ -42,6 +42,8 @@ import java.util.regex.PatternSyntaxException;
 public final class AffinityConfig {
 
 	public static final String FILE_NAME = "dhaffinity.json";
+	/** Bumped when a default changes in a way existing files must pick up (see {@link #readOrCreate}). */
+	public static final int CURRENT_CONFIG_VERSION = 2;
 	public static final int MIN_SWEEP_MS = 50;
 	public static final int MAX_TASK_BUDGET_MS = 50;
 	/** Registry pool name of the mod's own GPU upload thread (so it gets a menu row and a mask). */
@@ -59,6 +61,8 @@ public final class AffinityConfig {
 
 	/** On-disk representation. Public fields so Gson can (de)serialise it; missing keys keep defaults. */
 	public static final class Json {
+		/** Version of the defaults this file was written with; 0 = written before 1.0.2. */
+		public int configVersion = 0;
 		/** Master switch. */
 		public boolean enabled = true;
 		/** CPUs for everything that is not a DH worker. CPU list ({@code 0-15}) or hex ({@code 0x0000FFFF}); empty = all CPUs. */
@@ -96,9 +100,10 @@ public final class AffinityConfig {
 		public boolean logPins = false;
 		/**
 		 * Run Distant Horizons' GPU buffer uploads on a dedicated thread with its own OpenGL context
-		 * instead of the render thread (experimental; removes the upload hitch while exploring).
+		 * instead of the render thread. EXPERIMENTAL and off by default since 1.0.2: on NVIDIA a second
+		 * shared context serialises driver work against the render thread and caused frametime spikes.
 		 */
-		public boolean offThreadGpuUpload = true;
+		public boolean offThreadGpuUpload = false;
 		/**
 		 * Milliseconds per frame the render thread may spend on DH's queued GL tasks when uploads are
 		 * NOT off-loaded; 0 = DH's own default (half a frame at your FPS limit).
@@ -112,6 +117,7 @@ public final class AffinityConfig {
 
 		public Json copy() {
 			Json c = new Json();
+			c.configVersion = configVersion;
 			c.enabled = enabled;
 			c.gameMask = gameMask;
 			c.mainThreadMask = mainThreadMask;
@@ -247,6 +253,7 @@ public final class AffinityConfig {
 	 */
 	public static Json defaultsFor(long allCpusMask, CpuTopology topology) {
 		Json json = new Json();
+		json.configVersion = CURRENT_CONFIG_VERSION;
 		List<CpuTopology.CacheGroup> groups = new ArrayList<>();
 		for (CpuTopology.CacheGroup g : topology.l3Groups()) {
 			long m = g.mask() & allCpusMask;
@@ -282,20 +289,22 @@ public final class AffinityConfig {
 	 */
 	public static Json readOrCreate(Path file, Logger log, Supplier<Json> defaults) {
 		if (Files.exists(file)) {
+			Json json;
 			try (Reader reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
-				Json json = GSON.fromJson(reader, Json.class);
-				if (json == null) {
-					log.warn("DH Affinity: {} is empty; using defaults.", file);
-					return defaults.get();
-				}
-				if (json.dhPoolMasks == null) {
-					json.dhPoolMasks = new LinkedHashMap<>();
-				}
-				return json;
+				json = GSON.fromJson(reader, Json.class);
 			} catch (IOException | JsonParseException e) {
 				log.error("DH Affinity: cannot read {} ({}); using defaults. The file was left unchanged.", file, e.toString());
 				return defaults.get();
 			}
+			if (json == null) {
+				log.warn("DH Affinity: {} is empty; using defaults.", file);
+				return defaults.get();
+			}
+			if (json.dhPoolMasks == null) {
+				json.dhPoolMasks = new LinkedHashMap<>();
+			}
+			migrate(json, file, log); // the reader is closed: the rewrite replaces the file safely
+			return json;
 		}
 		Json json = defaults.get();
 		try {
@@ -305,6 +314,27 @@ public final class AffinityConfig {
 			log.error("DH Affinity: cannot write default config to {} ({}); using defaults.", file, e.toString());
 		}
 		return json;
+	}
+
+	/**
+	 * Bring a file written by an older version up to the current defaults where the old default was a
+	 * mistake. Version 2 (1.0.2): off-thread GPU upload is off by default — on NVIDIA the second shared
+	 * OpenGL context serialised driver work against the render thread and caused frametime spikes.
+	 */
+	static void migrate(Json json, Path file, Logger log) {
+		if (json.configVersion >= CURRENT_CONFIG_VERSION) {
+			return;
+		}
+		if (json.configVersion < 2 && json.offThreadGpuUpload) {
+			json.offThreadGpuUpload = false;
+			log.warn("DH Affinity: 1.0.2 turns off-thread GPU upload OFF by default (a second OpenGL context can add frametime spikes on NVIDIA); {} was updated. It can be re-enabled in the menu as an experiment.", file);
+		}
+		json.configVersion = CURRENT_CONFIG_VERSION;
+		try {
+			write(file, json);
+		} catch (IOException e) {
+			log.warn("DH Affinity: could not rewrite {} after migrating it ({}).", file, e.toString());
+		}
 	}
 
 	/**
