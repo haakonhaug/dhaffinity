@@ -11,6 +11,7 @@ import java.util.Set;
 final class FakeBackend implements AffinityBackend {
 
 	final Map<Long, Long> threads = new LinkedHashMap<>();
+	final Map<Long, String> names = new LinkedHashMap<>();
 	final Set<Long> failing = new HashSet<>();
 	long allMask = 0xFFFF_FFFFL; // 32 CPUs
 	boolean windowsStyleProcessMask = true;
@@ -27,6 +28,18 @@ final class FakeBackend implements AffinityBackend {
 
 	void addThread(long tid, long mask) {
 		threads.put(tid, mask);
+	}
+
+	void addThread(long tid, long mask, String name) {
+		threads.put(tid, mask);
+		if (name != null) {
+			names.put(tid, name);
+		}
+	}
+
+	@Override
+	public String threadName(long tid) {
+		return names.get(tid);
 	}
 
 	@Override

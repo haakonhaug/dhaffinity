@@ -63,6 +63,7 @@ public final class AffinityConfigScreen extends Screen {
 	private static final String KEY_GAME = "game";
 	private static final String KEY_MAIN = "main";
 	private static final String KEY_DH = "dh";
+	private static final String KEY_CHUNK_GEN = "chunkgen";
 	private static final String POOL_PREFIX = "pool:";
 
 	private static final Map<String, String> POOL_DESCRIPTIONS = Map.of(
@@ -109,6 +110,7 @@ public final class AffinityConfigScreen extends Screen {
 	private GroupRow gameRow;
 	private GroupRow dhRow;
 	private GroupRow mainRow;
+	private GroupRow chunkGenRow;
 	private final List<GroupRow> poolRows = new ArrayList<>();
 	private Row advancedRow;
 	private Row optionsRow;
@@ -141,6 +143,8 @@ public final class AffinityConfigScreen extends Screen {
 		states.put(KEY_DH, new GroupState(parseMask(base.dhMask, cfg.dhMask), false));
 		boolean mainFollows = isBlank(base.mainThreadMask);
 		states.put(KEY_MAIN, new GroupState(mainFollows ? 0 : parseMask(base.mainThreadMask, cfg.mainThreadMask), mainFollows));
+		boolean chunkGenFollows = isBlank(base.chunkGenMask);
+		states.put(KEY_CHUNK_GEN, new GroupState(chunkGenFollows ? 0 : parseMask(base.chunkGenMask, cfg.chunkGenMask), chunkGenFollows));
 
 		TreeSet<String> extras = new TreeSet<>();
 		for (String pool : base.dhPoolMasks.keySet()) {
@@ -276,6 +280,8 @@ public final class AffinityConfigScreen extends Screen {
 				"Default for all Distant Horizons worker threads. Single pools can differ (Advanced).", null);
 		mainRow = new GroupRow(KEY_MAIN, "Main / render thread", "main thread",
 				"Only the main (render) thread. Keep it on the fastest cores.", gameRow);
+		chunkGenRow = new GroupRow(KEY_CHUNK_GEN, "Chunk generation workers", "chunk generation",
+				"Minecraft's background worker pool (chunk generation; C2ME's workers too). Keeping them off the game cores stops new-world stutter. Thread-name patterns: config file.", dhRow);
 		poolRows.clear();
 		for (String pool : poolNames) {
 			String description = POOL_DESCRIPTIONS.getOrDefault(pool, "Additional DH pool (seen in the config file or currently running).");
@@ -297,6 +303,7 @@ public final class AffinityConfigScreen extends Screen {
 		List<Row> rows = new ArrayList<>();
 		rows.add(gameRow);
 		rows.add(dhRow);
+		rows.add(chunkGenRow);
 		rows.add(advancedRow);
 		if (advanced) {
 			rows.add(mainRow);
@@ -328,6 +335,10 @@ public final class AffinityConfigScreen extends Screen {
 		if (!main.follow && main.mask == 0) {
 			empty.add("Main / render thread");
 		}
+		GroupState chunkGen = state(KEY_CHUNK_GEN);
+		if (!chunkGen.follow && chunkGen.mask == 0) {
+			empty.add("Chunk generation workers");
+		}
 		for (String pool : poolNames) {
 			GroupState st = state(POOL_PREFIX + pool);
 			if (!st.follow && st.mask == 0) {
@@ -351,6 +362,8 @@ public final class AffinityConfigScreen extends Screen {
 		json.dhMask = MaskFormat.toCpuList(state(KEY_DH).mask);
 		GroupState main = state(KEY_MAIN);
 		json.mainThreadMask = main.follow ? "" : MaskFormat.toCpuList(main.mask);
+		GroupState chunkGen = state(KEY_CHUNK_GEN);
+		json.chunkGenMask = chunkGen.follow ? "" : MaskFormat.toCpuList(chunkGen.mask);
 		json.dhPoolMasks = new LinkedHashMap<>();
 		for (String pool : poolNames) {
 			GroupState st = state(POOL_PREFIX + pool);
@@ -389,6 +402,9 @@ public final class AffinityConfigScreen extends Screen {
 		GroupState main = state(KEY_MAIN);
 		main.follow = true;
 		main.mask = 0;
+		GroupState chunkGen = state(KEY_CHUNK_GEN);
+		chunkGen.follow = true;
+		chunkGen.mask = 0;
 		for (String pool : poolNames) {
 			GroupState st = state(POOL_PREFIX + pool);
 			st.follow = true;

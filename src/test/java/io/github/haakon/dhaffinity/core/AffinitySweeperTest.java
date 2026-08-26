@@ -35,6 +35,62 @@ class AffinitySweeperTest {
 	}
 
 	@Test
+	void chunkGenerationWorkersGetTheirOwnMask() {
+		FakeBackend os = new FakeBackend();
+		os.addThread(30, ALL, "Worker-Main-3");
+		os.addThread(31, ALL, "c2me-worker-17");
+		os.addThread(32, ALL, "Chunk Render Task Executor #1");
+		os.addThread(33, ALL, "IO-Worker-2");
+		os.addThread(34, ALL, null); // name unknown -> plain game thread
+		os.addThread(35, ALL, "Worker-Main-1"); // Linux-style truncated names still match by prefix
+		DhAffinity core = DhAffinity.createDetached(os, TestConfigs.split());
+		AffinitySweeper sweeper = core.createSweeperForTest();
+
+		sweeper.sweepOnce();
+
+		// Default: same CPUs as Distant Horizons.
+		assertEquals(DH, os.threads.get(30L));
+		assertEquals(DH, os.threads.get(31L));
+		assertEquals(DH, os.threads.get(35L));
+		assertEquals(GAME, os.threads.get(32L));
+		assertEquals(GAME, os.threads.get(33L));
+		assertEquals(GAME, os.threads.get(34L));
+		assertEquals(3, sweeper.stats().lastChunkGenThreads());
+		assertEquals(java.util.Map.of("Worker-Main", 2, "c2me-worker", 1), sweeper.lastChunkGenNames());
+	}
+
+	@Test
+	void chunkGenerationMaskCanBeItsOwnAndCanBeDisabled() {
+		FakeBackend os = new FakeBackend();
+		os.addThread(30, ALL, "Worker-Main-3");
+		os.addThread(31, ALL, "c2me-worker-1");
+		DhAffinity core = DhAffinity.createDetached(os, TestConfigs.custom(j -> {
+			j.chunkGenMask = "24-31";
+			j.chunkGenThreadPatterns = java.util.List.of("Worker-Main-");
+		}));
+		core.createSweeperForTest().sweepOnce();
+		assertEquals(0xFF00_0000L, os.threads.get(30L));
+		assertEquals(GAME, os.threads.get(31L)); // pattern removed -> ordinary game thread
+
+		FakeBackend os2 = new FakeBackend();
+		os2.addThread(30, ALL, "Worker-Main-3");
+		DhAffinity core2 = DhAffinity.createDetached(os2, TestConfigs.custom(j -> j.chunkGenThreadPatterns = java.util.List.of()));
+		AffinitySweeper sweeper2 = core2.createSweeperForTest();
+		sweeper2.sweepOnce();
+		assertEquals(GAME, os2.threads.get(30L));
+		assertEquals(0, sweeper2.stats().lastChunkGenThreads());
+	}
+
+	@Test
+	void chunkGenerationIsNotAppliedWhenNonDhThreadsAreUnmanaged() {
+		FakeBackend os = new FakeBackend();
+		os.addThread(30, ALL, "Worker-Main-3");
+		DhAffinity core = DhAffinity.createDetached(os, TestConfigs.custom(j -> j.manageNonDhThreads = false));
+		core.createSweeperForTest().sweepOnce();
+		assertEquals(ALL, os.threads.get(30L));
+	}
+
+	@Test
 	void perPoolOverridesAndMainThreadMask() {
 		FakeBackend os = new FakeBackend();
 		os.addThread(1, ALL);   // main thread

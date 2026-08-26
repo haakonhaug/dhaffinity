@@ -6,6 +6,8 @@ import io.github.haakon.dhaffinity.config.AffinityConfig;
 import org.slf4j.Logger;
 
 import java.util.HashMap;
+import java.util.TreeMap;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -34,6 +36,8 @@ public final class AffinitySweeper implements Runnable {
 			long sweeps,
 			long lastThreads,
 			long lastDhThreads,
+			/** Non-DH threads that matched the chunk-generation patterns in the last sweep. */
+			long lastChunkGenThreads,
 			long lastCorrected,
 			long lastUnchanged,
 			long lastSkipped,
@@ -47,7 +51,7 @@ public final class AffinitySweeper implements Runnable {
 			long processMaskResets,
 			long lastSweepEpochMillis) {
 
-		static final Stats NONE = new Stats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+		static final Stats NONE = new Stats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 	}
 
 	private static final int MAX_FAILURE_LOGS = 5;
@@ -110,6 +114,8 @@ public final class AffinitySweeper implements Runnable {
 		resetBackoff = true;
 		poke();
 	}
+
+	private volatile Map<String, Integer> lastChunkGenNames = Map.of();
 
 	public Stats stats() {
 		return stats;
@@ -215,6 +221,9 @@ public final class AffinitySweeper implements Runnable {
 		int gone = 0;
 		int failed = 0;
 		int dhSeen = 0;
+		int chunkGenSeen = 0;
+		Map<String, Integer> chunkGenNames = new TreeMap<>();
+		boolean chunkGen = cfg.chunkGenActive() && cfg.chunkGenMask != 0 && registryOnly == null;
 		long mainTid = core.mainThreadTid();
 		for (long tid : tids) {
 			ThreadRegistry.DhThread dh = registryOnly != null ? registryOnly.get(tid) : registry.get(tid);
@@ -223,13 +232,25 @@ public final class AffinitySweeper implements Runnable {
 				continue; // cannot happen (snapshot-derived), kept as a guard
 			}
 			long desired;
+			String kind;
 			if (dh != null) {
 				dhSeen++;
 				desired = cfg.maskForDhPool(dh.pool());
+				kind = "DH " + dh.pool();
 			} else if (tid == mainTid && mainTid != 0) {
 				desired = cfg.mainThreadMask;
+				kind = "main thread";
 			} else {
-				desired = cfg.gameMask;
+				String name = chunkGen ? backend.threadName(tid) : null;
+				if (name != null && cfg.isChunkGenThread(name)) {
+					chunkGenSeen++;
+					chunkGenNames.merge(namePrefix(name), 1, Integer::sum);
+					desired = cfg.chunkGenMask;
+					kind = "chunk gen";
+				} else {
+					desired = cfg.gameMask;
+					kind = "game";
+				}
 			}
 			if (desired == 0) {
 				skipped++;
@@ -262,7 +283,7 @@ public final class AffinitySweeper implements Runnable {
 					clearFailure(tid);
 					if (cfg.logPins) {
 						log.info("DH Affinity: pinned thread {} -> {} (CPUs {}) [{}]", tid, MaskFormat.toHex(desired),
-								MaskFormat.toCpuList(desired), dh != null ? "DH " + dh.pool() : tid == mainTid ? "main thread" : "game");
+								MaskFormat.toCpuList(desired), kind);
 					}
 				}
 				case GONE -> {
@@ -302,8 +323,20 @@ public final class AffinitySweeper implements Runnable {
 		if (previous.sweeps() > 0) {
 			maxDurationMicros = Math.max(maxDurationMicros, durationMicros);
 		}
-		stats = new Stats(sweepNo, tids.length, dhSeen, corrected, unchanged, skipped, gone, failed,
+		lastChunkGenNames = Collections.unmodifiableMap(chunkGenNames);
+		stats = new Stats(sweepNo, tids.length, dhSeen, chunkGenSeen, corrected, unchanged, skipped, gone, failed,
 				durationMicros, maxDurationMicros, totalCorrected, totalFailed, processMaskResets, System.currentTimeMillis());
+	}
+
+	/** Thread-name prefixes that matched the chunk-generation patterns in the last sweep, with counts. */
+	public Map<String, Integer> lastChunkGenNames() {
+		return lastChunkGenNames;
+	}
+
+	/** "Worker-Main-12" -> "Worker-Main", "Chunk Render Task Executor #3" -> "Chunk Render Task Executor". */
+	static String namePrefix(String name) {
+		String prefix = name.replaceAll("[\\s#\\-_]*\\d+$", "");
+		return prefix.isEmpty() ? name : prefix;
 	}
 
 	private void clearFailure(long tid) {

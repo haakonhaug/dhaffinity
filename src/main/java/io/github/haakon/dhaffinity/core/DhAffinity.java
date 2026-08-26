@@ -157,11 +157,15 @@ public final class DhAffinity {
 			vanillaWorkerCap = existing + " (set outside the mod)";
 			return;
 		}
-		int cap = Math.max(1, Long.bitCount(cfg.gameMask) - 1);
+		// Size the pool for the CPUs its threads will actually run on: the chunk-generation group when
+		// it catches vanilla's workers, otherwise the game CPUs.
+		boolean onChunkGen = cfg.chunkGenActive() && cfg.chunkGenMask != 0 && cfg.isChunkGenThread("Worker-Main-0");
+		long workerCpus = onChunkGen ? cfg.chunkGenMask : cfg.gameMask;
+		int cap = Math.max(1, Long.bitCount(workerCpus) - 1);
 		System.setProperty(MAX_BG_THREADS_PROPERTY, Integer.toString(cap));
 		vanillaWorkerCap = Integer.toString(cap);
-		LOG.info("DH Affinity: set -D{}={} so Minecraft's background worker pool matches the {} game CPUs.",
-				MAX_BG_THREADS_PROPERTY, cap, Long.bitCount(cfg.gameMask));
+		LOG.info("DH Affinity: set -D{}={} so Minecraft's background worker pool matches the {} CPUs it runs on ({}).",
+				MAX_BG_THREADS_PROPERTY, cap, Long.bitCount(workerCpus), onChunkGen ? "chunk-generation group" : "game CPUs");
 	}
 
 	private void widenProcessAffinity(AffinityConfig cfg) {
@@ -325,6 +329,25 @@ public final class DhAffinity {
 					+ " | interval " + s.currentIntervalMs() + " ms");
 			lines.add("Totals: corrected " + st.totalCorrected() + " | failed " + st.totalFailed()
 					+ " | process-mask resets " + st.processMaskResets());
+		}
+		if (cfg.chunkGenActive()) {
+			StringBuilder sb = new StringBuilder("Chunk generation -> CPUs ").append(MaskFormat.toCpuList(cfg.chunkGenMask))
+					.append(" | patterns ").append(cfg.chunkGenPatternTexts);
+			if (!cfg.manageNonDhThreads) {
+				sb.append(" | NOT applied (non-DH threads are not managed)");
+			} else if (s == null) {
+				sb.append(" | matched: sweeper not running");
+			} else {
+				sb.append(" | matched ").append(s.stats().lastChunkGenThreads()).append(" threads");
+				Map<String, Integer> names = s.lastChunkGenNames();
+				if (!names.isEmpty()) {
+					sb.append(" (");
+					names.forEach((name, count) -> sb.append(name).append(" x").append(count).append(", "));
+					sb.setLength(sb.length() - 2);
+					sb.append(')');
+				}
+			}
+			lines.add(sb.toString());
 		}
 		Map<String, Integer> byPool = new TreeMap<>();
 		for (ThreadRegistry.DhThread t : registry.snapshot()) {

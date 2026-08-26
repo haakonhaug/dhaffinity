@@ -180,6 +180,16 @@ public final class LinuxAffinityBackend implements AffinityBackend {
 	}
 
 	@Override
+	public String threadName(long tid) {
+		try {
+			String name = Files.readString(TASK_DIR.resolve(Long.toString(tid)).resolve("comm"), StandardCharsets.UTF_8).trim();
+			return name.isEmpty() ? null : name;
+		} catch (IOException | RuntimeException e) {
+			return null; // the thread exited, or /proc is unavailable
+		}
+	}
+
+	@Override
 	public long getThreadAffinity(long tid) {
 		Memory set = new Memory(CPU_SET_SIZE);
 		set.clear();

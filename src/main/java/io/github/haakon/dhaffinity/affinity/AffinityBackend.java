@@ -36,6 +36,15 @@ public interface AffinityBackend {
 	/** Native IDs of every thread in this process; empty if unsupported. */
 	long[] enumerateThreadIds();
 
+	/**
+	 * Name of the given thread as the OS sees it (the JVM publishes Java thread names to the OS),
+	 * or {@code null} if unknown or unsupported. Linux truncates names to 15 characters, so
+	 * callers match by prefix.
+	 */
+	default String threadName(long tid) {
+		return null;
+	}
+
 	/** Current mask of the given thread, or {@code 0} if unknown. */
 	long getThreadAffinity(long tid);
 

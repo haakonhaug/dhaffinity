@@ -21,6 +21,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 /**
  * Resolved, validated configuration. Immutable; a reload produces a new instance.
@@ -32,6 +34,8 @@ import java.util.function.Supplier;
  *   <li>{@code dhMask} — Distant Horizons worker threads.</li>
  *   <li>{@code dhPoolMasks} — per-pool overrides ({@code "World Gen": "16-23"}); a pool that is
  *       absent or empty follows {@code dhMask}.</li>
+ *   <li>{@code chunkGenMask} — Minecraft's own terrain-generation workers (threads whose name
+ *       starts with one of {@code chunkGenThreadPatterns}); empty = same as {@code dhMask}.</li>
  * </ul>
  * Masks may overlap freely. An empty {@code gameMask}/{@code dhMask} means "all CPUs".
  */
@@ -45,6 +49,11 @@ public final class AffinityConfig {
 	/** DH pools that get their own row in the menu; every other pool follows {@code dhMask}. */
 	public static final List<String> KNOWN_DH_POOLS = List.of(
 			"World Gen", "LOD Builder", "Render Loader", "IO", "Update Propagator", "Network Compression", "GPU Upload");
+	/**
+	 * Thread-name prefixes (regular expressions, matched at the start of the name) of the game's
+	 * terrain-generation workers: vanilla's background pool and C2ME's global executor.
+	 */
+	public static final List<String> DEFAULT_CHUNK_GEN_PATTERNS = List.of("Worker-Main-", "c2me-worker-");
 
 	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
 
@@ -60,6 +69,17 @@ public final class AffinityConfig {
 		public String dhMask = "";
 		/** Per-pool overrides, e.g. {@code {"World Gen": "16-23"}}; absent/empty = dhMask. */
 		public Map<String, String> dhPoolMasks = new LinkedHashMap<>();
+		/**
+		 * CPUs for Minecraft's own terrain-generation worker threads (see chunkGenThreadPatterns);
+		 * empty = same as dhMask. Keeping these off the game CPUs prevents stutter while a new world
+		 * generates.
+		 */
+		public String chunkGenMask = "";
+		/**
+		 * Regular expressions matched against the start of a thread's name; matching threads belong
+		 * to the chunk-generation group. An empty list disables the group.
+		 */
+		public List<String> chunkGenThreadPatterns = new ArrayList<>(DEFAULT_CHUNK_GEN_PATTERNS);
 		/** Pin every non-DH thread of the process (replaces a Process Lasso rule). */
 		public boolean manageNonDhThreads = true;
 		/** Keep the Windows process-wide affinity mask at "all CPUs" so thread pins can succeed. */
@@ -97,6 +117,8 @@ public final class AffinityConfig {
 			c.mainThreadMask = mainThreadMask;
 			c.dhMask = dhMask;
 			c.dhPoolMasks = dhPoolMasks == null ? new LinkedHashMap<>() : new LinkedHashMap<>(dhPoolMasks);
+			c.chunkGenMask = chunkGenMask;
+			c.chunkGenThreadPatterns = chunkGenThreadPatterns == null ? new ArrayList<>() : new ArrayList<>(chunkGenThreadPatterns);
 			c.manageNonDhThreads = manageNonDhThreads;
 			c.manageProcessAffinity = manageProcessAffinity;
 			c.capVanillaWorkerThreads = capVanillaWorkerThreads;
@@ -117,6 +139,12 @@ public final class AffinityConfig {
 	public final long dhMask;
 	/** Only the explicit, non-empty overrides. */
 	public final Map<String, Long> dhPoolMasks;
+	/** Mask for the chunk-generation group (already defaulted to {@link #dhMask} when unset). */
+	public final long chunkGenMask;
+	/** Compiled, valid {@code chunkGenThreadPatterns}; empty = group disabled. */
+	public final List<Pattern> chunkGenPatterns;
+	/** The texts of {@link #chunkGenPatterns}, for display. */
+	public final List<String> chunkGenPatternTexts;
 	public final boolean manageNonDhThreads;
 	public final boolean manageProcessAffinity;
 	public final boolean capVanillaWorkerThreads;
@@ -137,7 +165,8 @@ public final class AffinityConfig {
 	public final Json source;
 
 	private AffinityConfig(Json source, boolean enabled, long gameMask, long mainThreadMask, long dhMask,
-			Map<String, Long> dhPoolMasks, boolean manageNonDhThreads, boolean manageProcessAffinity,
+			Map<String, Long> dhPoolMasks, long chunkGenMask, List<Pattern> chunkGenPatterns, List<String> chunkGenPatternTexts,
+			boolean manageNonDhThreads, boolean manageProcessAffinity,
 			boolean capVanillaWorkerThreads, int startupSweepMs, int startupWindowMs, int steadySweepMs,
 			boolean logPins, boolean offThreadGpuUpload, int renderThreadTaskBudgetMs, String uploadPacing, int uploadPacingFixed,
 			List<String> warnings) {
@@ -147,6 +176,9 @@ public final class AffinityConfig {
 		this.mainThreadMask = mainThreadMask;
 		this.dhMask = dhMask;
 		this.dhPoolMasks = Collections.unmodifiableMap(new LinkedHashMap<>(dhPoolMasks));
+		this.chunkGenMask = chunkGenMask;
+		this.chunkGenPatterns = List.copyOf(chunkGenPatterns);
+		this.chunkGenPatternTexts = List.copyOf(chunkGenPatternTexts);
 		this.manageNonDhThreads = manageNonDhThreads;
 		this.manageProcessAffinity = manageProcessAffinity;
 		this.capVanillaWorkerThreads = capVanillaWorkerThreads;
@@ -165,7 +197,25 @@ public final class AffinityConfig {
 	public static AffinityConfig disabled() {
 		Json json = new Json();
 		json.enabled = false;
-		return new AffinityConfig(json, false, 0, 0, 0, Map.of(), false, false, false, 250, 30000, 2000, false, false, 0, "off", 0, List.of());
+		return new AffinityConfig(json, false, 0, 0, 0, Map.of(), 0, List.of(), List.of(), false, false, false, 250, 30000, 2000, false, false, 0, "off", 0, List.of());
+	}
+
+	/** Whether the chunk-generation group exists at all (at least one valid pattern). */
+	public boolean chunkGenActive() {
+		return !chunkGenPatterns.isEmpty();
+	}
+
+	/** Whether a thread with this OS-level name belongs to the chunk-generation group (prefix match). */
+	public boolean isChunkGenThread(String threadName) {
+		if (threadName == null) {
+			return false;
+		}
+		for (Pattern p : chunkGenPatterns) {
+			if (p.matcher(threadName).lookingAt()) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/** Mask for a DH pool: its override if present, otherwise {@code dhMask}. */
@@ -296,6 +346,23 @@ public final class AffinityConfig {
 			}
 		}
 
+		long chunkGenMask = resolveMask("chunkGenMask", json.chunkGenMask, allCpusMask, dhMask, warnings);
+		List<Pattern> chunkGenPatterns = new ArrayList<>();
+		List<String> chunkGenPatternTexts = new ArrayList<>();
+		if (json.chunkGenThreadPatterns != null) {
+			for (String text : json.chunkGenThreadPatterns) {
+				if (text == null || isBlank(text)) {
+					continue;
+				}
+				try {
+					chunkGenPatterns.add(Pattern.compile(text.trim()));
+					chunkGenPatternTexts.add(text.trim());
+				} catch (PatternSyntaxException e) {
+					warnings.add("chunkGenThreadPatterns: '" + text + "' is not a valid regular expression (" + e.getDescription() + "); ignoring it.");
+				}
+			}
+		}
+
 		int startupSweepMs = clampInterval("startupSweepMs", json.startupSweepMs, warnings);
 		int steadySweepMs = clampInterval("steadySweepMs", json.steadySweepMs, warnings);
 		int startupWindowMs = json.startupWindowMs;
@@ -329,7 +396,8 @@ public final class AffinityConfig {
 		for (String warning : warnings) {
 			log.warn("DH Affinity config: {}", warning);
 		}
-		return new AffinityConfig(json, json.enabled, gameMask, mainThreadMask, dhMask, poolMasks, json.manageNonDhThreads,
+		return new AffinityConfig(json, json.enabled, gameMask, mainThreadMask, dhMask, poolMasks, chunkGenMask, chunkGenPatterns,
+				chunkGenPatternTexts, json.manageNonDhThreads,
 				json.manageProcessAffinity, json.capVanillaWorkerThreads, startupSweepMs, startupWindowMs, steadySweepMs,
 				json.logPins, json.offThreadGpuUpload, budget, pacing, pacingFixed, warnings);
 	}

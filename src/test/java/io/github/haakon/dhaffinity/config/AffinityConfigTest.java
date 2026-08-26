@@ -40,6 +40,46 @@ class AffinityConfigTest {
 	}
 
 	@Test
+	void chunkGenerationGroupDefaultsFollowDhAndMatchByPrefix() {
+		AffinityConfig cfg = AffinityConfig.resolve(AffinityConfig.defaultsFor(ALL32, X3D), ALL32, LOG);
+		assertEquals(cfg.dhMask, cfg.chunkGenMask);
+		assertEquals(AffinityConfig.DEFAULT_CHUNK_GEN_PATTERNS, cfg.chunkGenPatternTexts);
+		assertTrue(cfg.chunkGenActive());
+		assertTrue(cfg.isChunkGenThread("Worker-Main-12"));
+		assertTrue(cfg.isChunkGenThread("c2me-worker-3"));
+		assertFalse(cfg.isChunkGenThread("Worker-Bootstrap-1"));
+		assertFalse(cfg.isChunkGenThread("IO-Worker-1"));
+		assertFalse(cfg.isChunkGenThread("Render thread"));
+		assertFalse(cfg.isChunkGenThread(null));
+		assertTrue(cfg.warnings.isEmpty(), cfg.warnings.toString());
+	}
+
+	@Test
+	void chunkGenerationPatternsAreValidatedAndAnOldFileKeepsTheDefaults(@TempDir Path dir) throws Exception {
+		AffinityConfig.Json json = AffinityConfig.defaultsFor(ALL32, X3D);
+		json.chunkGenMask = "8-11";
+		json.chunkGenThreadPatterns = List.of("Worker-Main-", "[broken", " ", "FastGen-Worker-");
+		AffinityConfig cfg = AffinityConfig.resolve(json, ALL32, LOG);
+		assertEquals(0xF00L, cfg.chunkGenMask);
+		assertEquals(List.of("Worker-Main-", "FastGen-Worker-"), cfg.chunkGenPatternTexts);
+		assertEquals(1, cfg.warnings.size(), cfg.warnings.toString());
+		assertTrue(cfg.warnings.get(0).contains("[broken"));
+		assertTrue(cfg.isChunkGenThread("FastGen-Worker-2"));
+
+		// A config written by 1.0.0 has neither key: the group must appear with its defaults.
+		Path file = dir.resolve("dhaffinity.json");
+		Files.writeString(file, "{\n  \"gameMask\": \"0-15\",\n  \"dhMask\": \"16-31\"\n}", StandardCharsets.UTF_8);
+		AffinityConfig.Json old = AffinityConfig.readOrCreate(file, LOG, AffinityConfig.Json::new);
+		assertEquals("", old.chunkGenMask);
+		assertEquals(AffinityConfig.DEFAULT_CHUNK_GEN_PATTERNS, old.chunkGenThreadPatterns);
+		assertEquals(0xFFFF_0000L, AffinityConfig.resolve(old, ALL32, LOG).chunkGenMask);
+
+		// An explicit empty list disables the group and survives a copy.
+		json.chunkGenThreadPatterns = List.of();
+		assertFalse(AffinityConfig.resolve(json.copy(), ALL32, LOG).chunkGenActive());
+	}
+
+	@Test
 	void defaultsWithoutTopologyDoNotSplit() {
 		AffinityConfig.Json json = AffinityConfig.defaultsFor(0xFFFFL, CpuTopology.of(List.of()));
 		assertEquals("0-15", json.gameMask);

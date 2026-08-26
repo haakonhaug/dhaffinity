@@ -11,6 +11,7 @@ import com.sun.jna.platform.win32.WinBase;
 import com.sun.jna.platform.win32.WinDef.DWORD;
 import com.sun.jna.platform.win32.WinNT;
 import com.sun.jna.platform.win32.WinNT.HANDLE;
+import com.sun.jna.ptr.PointerByReference;
 import com.sun.jna.win32.StdCallLibrary;
 import com.sun.jna.win32.W32APIOptions;
 
@@ -45,10 +46,14 @@ public final class WindowsAffinityBackend implements AffinityBackend {
 		boolean Thread32First(HANDLE hSnapshot, Pointer entry);
 
 		boolean Thread32Next(HANDLE hSnapshot, Pointer entry);
+
+		/** HRESULT; the returned wide string must be freed with LocalFree (Windows 10 1607+). */
+		int GetThreadDescription(HANDLE hThread, PointerByReference ppszThreadDescription);
 	}
 
 	private static final long[] EMPTY = new long[0];
 	private static final int THREAD_ACCESS = WinNT.THREAD_QUERY_INFORMATION | WinNT.THREAD_SET_INFORMATION;
+	private static final int THREAD_QUERY_LIMITED_INFORMATION = 0x0800;
 	/** sizeof(THREADENTRY32): dwSize, cntUsage, th32ThreadID, th32OwnerProcessID, tpBasePri, tpDeltaPri, dwFlags. */
 	private static final int THREADENTRY32_SIZE = 28;
 	private static final int OFFSET_THREAD_ID = 8;
@@ -62,6 +67,8 @@ public final class WindowsAffinityBackend implements AffinityBackend {
 	private final int cpuCount;
 	/** Per-thread so a failure on the sweeper does not show up as the status command's error. */
 	private final ThreadLocal<Integer> lastError = ThreadLocal.withInitial(() -> 0);
+	/** Set once GetThreadDescription turns out to be missing (Windows older than 10 1607). */
+	private volatile boolean threadNamesUnsupported;
 
 	public WindowsAffinityBackend() {
 		this.k32 = Kernel32.INSTANCE;
@@ -163,6 +170,43 @@ public final class WindowsAffinityBackend implements AffinityBackend {
 			return java.util.Arrays.copyOf(out, n);
 		} finally {
 			k32.CloseHandle(snapshot);
+		}
+	}
+
+	@Override
+	public String threadName(long tid) {
+		if (threadNamesUnsupported) {
+			return null;
+		}
+		HANDLE handle = k32.OpenThread(THREAD_QUERY_LIMITED_INFORMATION, false, (int) tid);
+		if (handle == null) {
+			lastError.set(k32.GetLastError());
+			return null;
+		}
+		try {
+			PointerByReference ref = new PointerByReference();
+			int hr;
+			try {
+				hr = ext.GetThreadDescription(handle, ref);
+			} catch (UnsatisfiedLinkError e) {
+				threadNamesUnsupported = true;
+				return null;
+			}
+			if (hr < 0) {
+				return null;
+			}
+			Pointer text = ref.getValue();
+			if (text == null) {
+				return null;
+			}
+			try {
+				String name = text.getWideString(0);
+				return name.isEmpty() ? null : name;
+			} finally {
+				k32.LocalFree(text);
+			}
+		} finally {
+			k32.CloseHandle(handle);
 		}
 	}
 

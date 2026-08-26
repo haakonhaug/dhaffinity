@@ -49,6 +49,40 @@ Open it from ModMenu → DH Affinity → Configure, or type `/dhaffinity gui`.
   no restart needed. The only thing the menu refuses is an empty group (a thread with no CPU
   cannot run).
 
+## Chunk-generation workers (1.0.1)
+
+Minecraft generates its chunks on its background worker pool (`Worker-Main-N`; C2ME does the
+generation on its own `c2me-worker-N` threads instead). In a brand-new world those threads run
+flat out, and on a split-CCD CPU they used to share the game cores with the render thread —
+enough to starve it and produce the "new world stutter" the first version could not explain.
+
+`Worker-Main` is vanilla's *general* background pool: besides chunk generation it also does
+world saving, resource reloads and — without Sodium — chunk meshing. Name matching cannot split
+one pool, so the whole pool moves. With Sodium installed (the usual case) meshing has its own
+threads and stays with the game.
+
+Since 1.0.1 they form their own group, **Chunk generation workers**, shown in the menu under
+Distant Horizons and defaulting to *Same as Distant Horizons* (the high-clock CCD on a 9950X3D).
+Threads are recognised by name, so this needs no other mod and works with plain vanilla:
+
+```json
+"chunkGenMask": "",
+"chunkGenThreadPatterns": ["Worker-Main-", "c2me-worker-"]
+```
+
+* `chunkGenMask` — CPUs for the group; empty = same as `dhMask`.
+* `chunkGenThreadPatterns` — regular expressions matched against the **start** of a thread's
+  name (Linux truncates names to 15 characters, so prefixes are the reliable form). Add another
+  generator mod's threads by adding its prefix; an empty list disables the group. Only heavy
+  background pools belong here — sound, networking and Sodium's chunk meshing threads stay with
+  the game on purpose.
+* `/dhaffinity status` prints `Chunk generation -> CPUs … | matched N threads (Worker-Main x15,
+  c2me-worker x18)`, so you can see the patterns working. The group is only applied while
+  *Manage non-DH threads* is on.
+
+Upgrading from 1.0.0: this is on by default. To keep the old behaviour, open the menu, untick
+*Same as Distant Horizons* on the new row and select the game cores.
+
 ## How it works
 
 1. **`preLaunch`** (before Minecraft's own threads exist): read the config, widen the process
