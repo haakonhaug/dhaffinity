@@ -134,16 +134,19 @@ public final class HitchProfiler implements FrameStats.FrameListener {
 		JfrStallRecorder recorder = null;
 		try {
 			recorder = new JfrStallRecorder(target);
-			if (!recorder.start()) {
-				recorder = null;
-			}
-		} catch (Throwable t) { // no jdk.jfr module, or JFR refused
+			recorder.start(); // a failed start is kept: the report then says why the JVM section is missing
+		} catch (Throwable t) { // no jdk.jfr module at all
 			recorder = null;
 		}
+		boolean published = false;
 		synchronized (this) {
-			if (generation == myGeneration) {
+			if (generation == myGeneration && running) {
 				jfr = recorder;
+				published = true;
 			}
+		}
+		if (!published && recorder != null) {
+			recorder.stopAndReport(); // the profile was stopped (or replaced) while JFR was starting: do not leak the stream
 		}
 		while (running && target != null) {
 			long now = System.nanoTime();
