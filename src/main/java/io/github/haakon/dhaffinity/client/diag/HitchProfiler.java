@@ -42,6 +42,7 @@ public final class HitchProfiler implements FrameStats.FrameListener {
 	private final Map<String, Integer> hitchCategories = new HashMap<>();
 	private final Map<String, Map<String, Integer>> hitchDetails = new HashMap<>();
 	private final Map<String, Integer> outsideCategories = new HashMap<>();
+	private final Map<String, Map<String, Integer>> outsideDetails = new HashMap<>();
 	/** Frame-time histogram for the window: <16, 16-33, 33-50, 50-100, 100-250, >250 ms. */
 	private final int[] histogram = new int[6];
 	private static final long[] HISTOGRAM_EDGES_MS = {16, 33, 50, 100, 250};
@@ -75,6 +76,7 @@ public final class HitchProfiler implements FrameStats.FrameListener {
 		hitchCategories.clear();
 		hitchDetails.clear();
 		outsideCategories.clear();
+		outsideDetails.clear();
 		java.util.Arrays.fill(histogram, 0);
 		java.util.Arrays.fill(longestNanos, 0);
 		java.util.Arrays.fill(longestWhat, null);
@@ -220,6 +222,7 @@ public final class HitchProfiler implements FrameStats.FrameListener {
 			} else {
 				samplesOutside++;
 				outsideCategories.merge(cls[0], 1, Integer::sum);
+				outsideDetails.computeIfAbsent(cls[0], k -> new HashMap<>()).merge(cls[1], 1, Integer::sum);
 			}
 		}
 		if (hitch) {
@@ -386,17 +389,29 @@ public final class HitchProfiler implements FrameStats.FrameListener {
 			}
 		}
 		if (samplesOutside > 0) {
+			lines.add("Where ORDINARY frames spend their time (this is the steady cost per frame):");
 			List<Map.Entry<String, Integer>> sorted = new ArrayList<>(outsideCategories.entrySet());
 			sorted.sort(Comparator.comparingInt((Map.Entry<String, Integer> e) -> e.getValue()).reversed());
-			StringBuilder sb = new StringBuilder("For comparison, smooth frames: ");
 			int shown = 0;
+			int covered = 0;
 			for (Map.Entry<String, Integer> e : sorted) {
-				if (shown++ >= 3) {
+				if (shown++ >= 10) {
 					break;
 				}
-				sb.append(Math.round(100.0 * e.getValue() / samplesOutside)).append("% ").append(e.getKey()).append("; ");
+				covered += e.getValue();
+				Map<String, Integer> detail = outsideDetails.getOrDefault(e.getKey(), Map.of());
+				String top = detail.entrySet().stream().max(Map.Entry.comparingByValue()).map(Map.Entry::getKey).orElse("?");
+				lines.add(String.format(Locale.ROOT, "  %3d%%  %s — mostly %s", Math.round(100.0 * e.getValue() / samplesOutside), e.getKey(), top));
 			}
-			lines.add(sb.toString());
+			if (covered < samplesOutside) {
+				lines.add(String.format(Locale.ROOT, "  %3d%%  (everything else)", Math.round(100.0 * (samplesOutside - covered) / samplesOutside)));
+			}
+		}
+		long expected = (endNanos - profileStartNanos) / SAMPLE_INTERVAL_NANOS;
+		long got = Math.min(sampleCount, expected);
+		if (expected > 0 && got * 100 / expected < 70) {
+			lines.add(String.format(Locale.ROOT, "Measurement health: only %d%% of intended samples were taken — the sampler itself was slowed; percentages are still valid, absolute coverage is not.",
+					got * 100 / expected));
 		}
 		lines.add(String.format(Locale.ROOT, "Frame times: <16 ms %d | 16-33 %d | 33-50 %d | 50-100 %d | 100-250 %d | >250 ms %d",
 				histogram[0], histogram[1], histogram[2], histogram[3], histogram[4], histogram[5]));
