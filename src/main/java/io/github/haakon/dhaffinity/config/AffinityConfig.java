@@ -56,6 +56,9 @@ public final class AffinityConfig {
 	 * terrain-generation workers: vanilla's background pool and C2ME's global executor.
 	 */
 	public static final List<String> DEFAULT_CHUNK_GEN_PATTERNS = List.of("Worker-Main-", "c2me-worker-");
+	/** Thread-name prefixes of the JVM's own service threads (garbage collector, JIT compilers, VM). */
+	public static final List<String> DEFAULT_JVM_PATTERNS = List.of("ZWorker", "ZDriver", "ZDirector", "ZUncommitter", "ZStat",
+			"GC Thread", "G1 ", "C1 CompilerThread", "C2 CompilerThread", "VM Thread", "VM Periodic", "Sweeper thread");
 
 	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
 
@@ -84,6 +87,13 @@ public final class AffinityConfig {
 		 * to the chunk-generation group. An empty list disables the group.
 		 */
 		public List<String> chunkGenThreadPatterns = new ArrayList<>(DEFAULT_CHUNK_GEN_PATTERNS);
+		/**
+		 * CPUs for the JVM's own threads (garbage collector, JIT); empty = same as gameMask (the 1.0.x
+		 * behaviour), "none" = leave them unpinned so the OS may run them on any core.
+		 */
+		public String jvmMask = "";
+		/** Thread-name prefixes (regular expressions) of the JVM's service threads; empty list = treat as game threads. */
+		public List<String> jvmThreadPatterns = new ArrayList<>(DEFAULT_JVM_PATTERNS);
 		/** Pin every non-DH thread of the process (replaces a Process Lasso rule). */
 		public boolean manageNonDhThreads = true;
 		/** Keep the Windows process-wide affinity mask at "all CPUs" so thread pins can succeed. */
@@ -125,6 +135,8 @@ public final class AffinityConfig {
 			c.dhPoolMasks = dhPoolMasks == null ? new LinkedHashMap<>() : new LinkedHashMap<>(dhPoolMasks);
 			c.chunkGenMask = chunkGenMask;
 			c.chunkGenThreadPatterns = chunkGenThreadPatterns == null ? new ArrayList<>() : new ArrayList<>(chunkGenThreadPatterns);
+			c.jvmMask = jvmMask;
+			c.jvmThreadPatterns = jvmThreadPatterns == null ? new ArrayList<>() : new ArrayList<>(jvmThreadPatterns);
 			c.manageNonDhThreads = manageNonDhThreads;
 			c.manageProcessAffinity = manageProcessAffinity;
 			c.capVanillaWorkerThreads = capVanillaWorkerThreads;
@@ -151,6 +163,10 @@ public final class AffinityConfig {
 	public final List<Pattern> chunkGenPatterns;
 	/** The texts of {@link #chunkGenPatterns}, for display. */
 	public final List<String> chunkGenPatternTexts;
+	/** Mask for the JVM group; 0 = leave those threads unpinned. */
+	public final long jvmMask;
+	public final List<Pattern> jvmPatterns;
+	public final List<String> jvmPatternTexts;
 	public final boolean manageNonDhThreads;
 	public final boolean manageProcessAffinity;
 	public final boolean capVanillaWorkerThreads;
@@ -172,6 +188,7 @@ public final class AffinityConfig {
 
 	private AffinityConfig(Json source, boolean enabled, long gameMask, long mainThreadMask, long dhMask,
 			Map<String, Long> dhPoolMasks, long chunkGenMask, List<Pattern> chunkGenPatterns, List<String> chunkGenPatternTexts,
+			long jvmMask, List<Pattern> jvmPatterns, List<String> jvmPatternTexts,
 			boolean manageNonDhThreads, boolean manageProcessAffinity,
 			boolean capVanillaWorkerThreads, int startupSweepMs, int startupWindowMs, int steadySweepMs,
 			boolean logPins, boolean offThreadGpuUpload, int renderThreadTaskBudgetMs, String uploadPacing, int uploadPacingFixed,
@@ -185,6 +202,9 @@ public final class AffinityConfig {
 		this.chunkGenMask = chunkGenMask;
 		this.chunkGenPatterns = List.copyOf(chunkGenPatterns);
 		this.chunkGenPatternTexts = List.copyOf(chunkGenPatternTexts);
+		this.jvmMask = jvmMask;
+		this.jvmPatterns = List.copyOf(jvmPatterns);
+		this.jvmPatternTexts = List.copyOf(jvmPatternTexts);
 		this.manageNonDhThreads = manageNonDhThreads;
 		this.manageProcessAffinity = manageProcessAffinity;
 		this.capVanillaWorkerThreads = capVanillaWorkerThreads;
@@ -203,7 +223,7 @@ public final class AffinityConfig {
 	public static AffinityConfig disabled() {
 		Json json = new Json();
 		json.enabled = false;
-		return new AffinityConfig(json, false, 0, 0, 0, Map.of(), 0, List.of(), List.of(), false, false, false, 250, 30000, 2000, false, false, 0, "off", 0, List.of());
+		return new AffinityConfig(json, false, 0, 0, 0, Map.of(), 0, List.of(), List.of(), 0, List.of(), List.of(), false, false, false, 250, 30000, 2000, false, false, 0, "off", 0, List.of());
 	}
 
 	/** Whether the chunk-generation group exists at all (at least one valid pattern). */
@@ -213,10 +233,24 @@ public final class AffinityConfig {
 
 	/** Whether a thread with this OS-level name belongs to the chunk-generation group (prefix match). */
 	public boolean isChunkGenThread(String threadName) {
+		return matchesAny(chunkGenPatterns, threadName);
+	}
+
+	/** Whether the JVM-thread group exists (at least one valid pattern). */
+	public boolean jvmGroupActive() {
+		return !jvmPatterns.isEmpty();
+	}
+
+	/** Whether a thread with this OS-level name is one of the JVM's own service threads (prefix match). */
+	public boolean isJvmThread(String threadName) {
+		return matchesAny(jvmPatterns, threadName);
+	}
+
+	private static boolean matchesAny(List<Pattern> patterns, String threadName) {
 		if (threadName == null) {
 			return false;
 		}
-		for (Pattern p : chunkGenPatterns) {
+		for (Pattern p : patterns) {
 			if (p.matcher(threadName).lookingAt()) {
 				return true;
 			}
@@ -393,6 +427,16 @@ public final class AffinityConfig {
 			}
 		}
 
+		long jvmMask;
+		if (json.jvmMask != null && json.jvmMask.trim().equalsIgnoreCase("none")) {
+			jvmMask = 0; // leave unpinned
+		} else {
+			jvmMask = resolveMask("jvmMask", json.jvmMask, allCpusMask, gameMask, warnings);
+		}
+		List<Pattern> jvmPatterns = new ArrayList<>();
+		List<String> jvmPatternTexts = new ArrayList<>();
+		compilePatterns("jvmThreadPatterns", json.jvmThreadPatterns, jvmPatterns, jvmPatternTexts, warnings);
+
 		int startupSweepMs = clampInterval("startupSweepMs", json.startupSweepMs, warnings);
 		int steadySweepMs = clampInterval("steadySweepMs", json.steadySweepMs, warnings);
 		int startupWindowMs = json.startupWindowMs;
@@ -427,13 +471,30 @@ public final class AffinityConfig {
 			log.warn("DH Affinity config: {}", warning);
 		}
 		return new AffinityConfig(json, json.enabled, gameMask, mainThreadMask, dhMask, poolMasks, chunkGenMask, chunkGenPatterns,
-				chunkGenPatternTexts, json.manageNonDhThreads,
+				chunkGenPatternTexts, jvmMask, jvmPatterns, jvmPatternTexts, json.manageNonDhThreads,
 				json.manageProcessAffinity, json.capVanillaWorkerThreads, startupSweepMs, startupWindowMs, steadySweepMs,
 				json.logPins, json.offThreadGpuUpload, budget, pacing, pacingFixed, warnings);
 	}
 
 	private static boolean isBlank(String s) {
 		return s == null || s.trim().isEmpty();
+	}
+
+	private static void compilePatterns(String key, List<String> texts, List<Pattern> out, List<String> outTexts, List<String> warnings) {
+		if (texts == null) {
+			return;
+		}
+		for (String text : texts) {
+			if (text == null || isBlank(text)) {
+				continue;
+			}
+			try {
+				out.add(Pattern.compile(text.trim()));
+				outTexts.add(text.trim());
+			} catch (PatternSyntaxException e) {
+				warnings.add(key + ": '" + text + "' is not a valid regular expression (" + e.getDescription() + "); ignoring it.");
+			}
+		}
 	}
 
 	/**

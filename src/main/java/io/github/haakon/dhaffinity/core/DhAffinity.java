@@ -332,6 +332,10 @@ public final class DhAffinity {
 			lines.add("Totals: corrected " + st.totalCorrected() + " | failed " + st.totalFailed()
 					+ " | process-mask resets " + st.processMaskResets());
 		}
+		if (cfg.jvmGroupActive() && cfg.manageNonDhThreads) {
+			lines.add("JVM threads (GC, JIT) -> " + (cfg.jvmMask == 0 ? "unpinned (OS decides)" : "CPUs " + MaskFormat.toCpuList(cfg.jvmMask))
+					+ " | matched " + (s == null ? "?" : Integer.toString(s.lastJvmThreads())) + " threads | jvmMask \"none\" leaves them unpinned");
+		}
 		if (cfg.chunkGenActive()) {
 			StringBuilder sb = new StringBuilder("Chunk generation -> CPUs ").append(MaskFormat.toCpuList(cfg.chunkGenMask))
 					.append(" | patterns ").append(cfg.chunkGenPatternTexts);

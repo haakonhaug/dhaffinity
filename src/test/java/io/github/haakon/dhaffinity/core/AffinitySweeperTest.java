@@ -183,6 +183,34 @@ class AffinitySweeperTest {
 	}
 
 	@Test
+	void jvmThreadsFollowTheirOwnMaskOrStayUnpinned() {
+		FakeBackend os = new FakeBackend();
+		os.addThread(40, ALL, "ZWorkerYoung#0");
+		os.addThread(41, ALL, "C2 CompilerThread0");
+		os.addThread(42, ALL, "Netty Client IO #1");
+		DhAffinity core = DhAffinity.createDetached(os, TestConfigs.split());
+		AffinitySweeper sweeper = core.createSweeperForTest();
+		sweeper.sweepOnce();
+		assertEquals(GAME, os.threads.get(40L), "default: same as the game");
+		assertEquals(GAME, os.threads.get(41L));
+		assertEquals(2, sweeper.lastJvmThreads());
+
+		FakeBackend os2 = new FakeBackend();
+		os2.addThread(40, ALL, "ZWorkerYoung#0");
+		os2.addThread(42, ALL, "Netty Client IO #1");
+		DhAffinity core2 = DhAffinity.createDetached(os2, TestConfigs.custom(j -> j.jvmMask = "none"));
+		core2.createSweeperForTest().sweepOnce();
+		assertEquals(ALL, os2.threads.get(40L), "\"none\" leaves the GC thread alone");
+		assertEquals(GAME, os2.threads.get(42L));
+
+		FakeBackend os3 = new FakeBackend();
+		os3.addThread(40, ALL, "ZWorkerYoung#0");
+		DhAffinity core3 = DhAffinity.createDetached(os3, TestConfigs.custom(j -> j.jvmMask = "16-31"));
+		core3.createSweeperForTest().sweepOnce();
+		assertEquals(DH, os3.threads.get(40L));
+	}
+
+	@Test
 	void chunkGenerationIsNotAppliedWhenNonDhThreadsAreUnmanaged() {
 		FakeBackend os = new FakeBackend();
 		os.addThread(30, ALL, "Worker-Main-3");

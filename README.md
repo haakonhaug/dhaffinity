@@ -209,12 +209,31 @@ If you prefer to keep G1, at least size its threads for the game cores instead o
 -Xms8G -Xmx8G -XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:ParallelGCThreads=12 -XX:ConcGCThreads=3
 ```
 
+## JVM threads (garbage collector, JIT)
+
+The JVM's own service threads (`ZWorker*`, `C2 CompilerThread*`, `VM Thread`, …) count as game
+threads and follow `gameMask`, as in 1.0.x. Since 1.0.2 they are a named group so you can see them
+(`/dhaffinity status` → "JVM threads (GC, JIT) -> … | matched N") and move them:
+
+```json
+"jvmMask": "",        // "" = same as gameMask, "none" = leave unpinned (OS decides), or a CPU list
+"jvmThreadPatterns": ["ZWorker", "ZDriver", "ZDirector", "ZUncommitter", "ZStat", "GC Thread", "G1 ", "C1 CompilerThread", "C2 CompilerThread", "VM Thread", "VM Periodic", "Sweeper thread"]
+```
+
+When Distant Horizons generates at full speed it allocates a lot; if the collector cannot keep up,
+threads stall on allocation. `/dhaffinity profile` reports those stalls (below), which tells you
+whether giving the collector more or different cores is worth trying.
+
 ## Reading the numbers
 
 `/dhaffinity status` reports **spikes** (frames over 2x the running average and over 8 ms — what a
 frametime graph shows as a blip) separately from **hitches** (>2.5x and >33 ms). Judge changes by
 spikes, average and worst frame, not by hitch count alone; `/dhaffinity profile <seconds>` attributes
-spike frames to whatever the render thread was doing.
+spike frames to whatever the render thread was doing. Since 1.0.2 the profile also prints a
+frame-time histogram, the five longest frames with what dominated each, and — via Flight Recorder,
+for the profile's duration only — JVM stalls the sampler cannot see: stop-the-world GC pauses, ZGC
+allocation stalls (and how many hit the render thread), and every time the render thread blocked on a
+lock or park for more than 8 ms, with the call site.
 
 ## In-game commands
 

@@ -42,6 +42,12 @@ public final class HitchProfiler implements FrameStats.FrameListener {
 	private final Map<String, Integer> hitchCategories = new HashMap<>();
 	private final Map<String, Map<String, Integer>> hitchDetails = new HashMap<>();
 	private final Map<String, Integer> outsideCategories = new HashMap<>();
+	/** Frame-time histogram for the window: <16, 16-33, 33-50, 50-100, 100-250, >250 ms. */
+	private final int[] histogram = new int[6];
+	private static final long[] HISTOGRAM_EDGES_MS = {16, 33, 50, 100, 250};
+	private final long[] longestNanos = new long[5];
+	private final String[] longestWhat = new String[5];
+	private JfrStallRecorder jfr;
 	private Consumer<List<String>> reporter;
 
 	private HitchProfiler() {}
@@ -67,6 +73,11 @@ public final class HitchProfiler implements FrameStats.FrameListener {
 		hitchCategories.clear();
 		hitchDetails.clear();
 		outsideCategories.clear();
+		java.util.Arrays.fill(histogram, 0);
+		java.util.Arrays.fill(longestNanos, 0);
+		java.util.Arrays.fill(longestWhat, null);
+		jfr = new JfrStallRecorder(renderThread);
+		jfr.start();
 		running = true;
 		generation++;
 		int myGeneration = generation;
@@ -85,6 +96,10 @@ public final class HitchProfiler implements FrameStats.FrameListener {
 		running = false;
 		FrameStats.INSTANCE.removeListener(this);
 		List<String> report = buildReport();
+		if (jfr != null) {
+			report.addAll(jfr.stopAndReport());
+			jfr = null;
+		}
 		java.util.Arrays.fill(samples, null); // ~100 MB of stack traces otherwise stays referenced
 		Consumer<List<String>> r = reporter;
 		reporter = null;
@@ -135,6 +150,13 @@ public final class HitchProfiler implements FrameStats.FrameListener {
 		if (hitch) {
 			hitchFrames++;
 		}
+		long duration = endNanos - startNanos;
+		int bucket = 0;
+		while (bucket < HISTOGRAM_EDGES_MS.length && duration > HISTOGRAM_EDGES_MS[bucket] * 1_000_000L) {
+			bucket++;
+		}
+		histogram[bucket]++;
+		Map<String, Integer> frameCategories = hitch ? new HashMap<>() : null;
 		int n = (int) Math.min(sampleCount, RING);
 		for (int i = 0; i < n; i++) {
 			int idx = ((head - 1 - i) % RING + RING) % RING;
@@ -159,11 +181,32 @@ public final class HitchProfiler implements FrameStats.FrameListener {
 				samplesInHitches++;
 				hitchCategories.merge(cls[0], 1, Integer::sum);
 				hitchDetails.computeIfAbsent(cls[0], k -> new HashMap<>()).merge(cls[1], 1, Integer::sum);
+				frameCategories.merge(cls[0] + " — " + cls[1], 1, Integer::sum);
 			} else {
 				samplesOutside++;
 				outsideCategories.merge(cls[0], 1, Integer::sum);
 			}
 		}
+		if (hitch) {
+			rememberLongest(duration, frameCategories);
+		}
+	}
+
+	/** Keep the five longest spike frames with what dominated each, so storms have names. */
+	private void rememberLongest(long duration, Map<String, Integer> categories) {
+		int slot = -1;
+		for (int i = 0; i < longestNanos.length; i++) {
+			if (duration > longestNanos[i] && (slot < 0 || longestNanos[i] < longestNanos[slot])) {
+				slot = i;
+			}
+		}
+		if (slot < 0) {
+			return;
+		}
+		String what = categories.isEmpty() ? "(no samples)"
+				: categories.entrySet().stream().max(Map.Entry.comparingByValue()).map(Map.Entry::getKey).orElse("?");
+		longestNanos[slot] = duration;
+		longestWhat[slot] = what;
 	}
 
 	private static boolean isPlumbing(String className) {
@@ -212,7 +255,8 @@ public final class HitchProfiler implements FrameStats.FrameListener {
 			category = inTaskDrain ? DH_TASKS : category.equals(DH_TASKS) ? DH_RENDERING : category;
 		}
 		if (glCall != null) {
-			category = "OpenGL driver call inside " + category;
+			boolean audio = glCall.startsWith("nal") || glCall.startsWith("al");
+			category = (audio ? "OpenAL (sound) driver call inside " : "OpenGL driver call inside ") + category;
 		}
 		String where = shortName(owner.getClassName()) + "." + owner.getMethodName();
 		return new String[] {category, glCall != null ? where + " -> " + glCall : where};
@@ -318,6 +362,21 @@ public final class HitchProfiler implements FrameStats.FrameListener {
 				sb.append(Math.round(100.0 * e.getValue() / samplesOutside)).append("% ").append(e.getKey()).append("; ");
 			}
 			lines.add(sb.toString());
+		}
+		lines.add(String.format(Locale.ROOT, "Frame times: <16 ms %d | 16-33 %d | 33-50 %d | 50-100 %d | 100-250 %d | >250 ms %d",
+				histogram[0], histogram[1], histogram[2], histogram[3], histogram[4], histogram[5]));
+		StringBuilder longest = new StringBuilder("Longest frames:");
+		Integer[] order = {0, 1, 2, 3, 4};
+		java.util.Arrays.sort(order, (a, b) -> Long.compare(longestNanos[b], longestNanos[a]));
+		int listed = 0;
+		for (int i : order) {
+			if (longestNanos[i] == 0) {
+				continue;
+			}
+			longest.append(listed++ == 0 ? " " : "; ").append(String.format(Locale.ROOT, "%.0f ms (%s)", longestNanos[i] / 1e6, longestWhat[i]));
+		}
+		if (listed > 0) {
+			lines.add(longest.toString());
 		}
 		return lines;
 	}

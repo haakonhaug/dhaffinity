@@ -242,6 +242,8 @@ public final class AffinitySweeper implements Runnable {
 		int chunkGenSeen = 0;
 		Map<String, Integer> chunkGenNames = new TreeMap<>();
 		boolean chunkGen = cfg.chunkGenActive() && cfg.chunkGenMask != 0 && registryOnly == null && core.localWorld();
+		boolean jvmGroup = cfg.jvmGroupActive() && registryOnly == null;
+		int jvmSeen = 0;
 		long mainTid = core.mainThreadTid();
 		for (long tid : tids) {
 			ThreadRegistry.DhThread dh = registryOnly != null ? registryOnly.get(tid) : registry.get(tid);
@@ -259,12 +261,16 @@ public final class AffinitySweeper implements Runnable {
 				desired = cfg.mainThreadMask;
 				kind = "main thread";
 			} else {
-				String name = chunkGen ? cachedThreadName(backend, tid, sweepNo) : null;
-				if (name != null && cfg.isChunkGenThread(name)) {
+				String name = chunkGen || jvmGroup ? cachedThreadName(backend, tid, sweepNo) : null;
+				if (chunkGen && name != null && cfg.isChunkGenThread(name)) {
 					chunkGenSeen++;
 					chunkGenNames.merge(namePrefix(name), 1, Integer::sum);
 					desired = cfg.chunkGenMask;
 					kind = "chunk gen";
+				} else if (jvmGroup && name != null && cfg.isJvmThread(name)) {
+					jvmSeen++;
+					desired = cfg.jvmMask; // 0 = leave unpinned (skipped below)
+					kind = "jvm";
 				} else {
 					desired = cfg.gameMask;
 					kind = "game";
@@ -385,6 +391,7 @@ public final class AffinitySweeper implements Runnable {
 			maxDurationMicros = Math.max(maxDurationMicros, durationMicros);
 		}
 		lastChunkGenNames = Collections.unmodifiableMap(chunkGenNames);
+		lastJvmThreads = jvmSeen;
 		stats = new Stats(sweepNo, tids.length, dhSeen, chunkGenSeen, corrected, unchanged, skipped, gone, failed,
 				durationMicros, maxDurationMicros, totalCorrected, totalFailed, processMaskResets, System.currentTimeMillis());
 	}
@@ -403,6 +410,13 @@ public final class AffinitySweeper implements Runnable {
 			nameCache.put(tid, name == null ? "" : name);
 		}
 		return name;
+	}
+
+	private volatile int lastJvmThreads;
+
+	/** JVM service threads (GC, JIT) matched in the last sweep. */
+	public int lastJvmThreads() {
+		return lastJvmThreads;
 	}
 
 	/** Non-DH threads no longer re-pinned because they kept moving themselves back. */
