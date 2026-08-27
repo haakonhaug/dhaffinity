@@ -38,6 +38,7 @@ final class JfrStallRecorder {
 	private final AtomicLong allocStallNanos = new AtomicLong();
 	private final AtomicLong renderAllocStalls = new AtomicLong();
 	private final AtomicLong renderAllocStallNanos = new AtomicLong();
+	private volatile String lateError = "";
 	private final AtomicLong gcPauses = new AtomicLong();
 	private final AtomicLong gcPauseNanos = new AtomicLong();
 	private final Map<String, long[]> renderBlocks = new HashMap<>(); // where -> {count, nanos}
@@ -72,10 +73,7 @@ final class JfrStallRecorder {
 			rs.onEvent("jdk.JavaMonitorEnter", e -> recordBlock("monitor", e));
 			rs.onEvent("jdk.ThreadPark", e -> recordBlock("park", e));
 			rs.onEvent("jdk.JavaMonitorWait", e -> recordBlock("wait", e));
-			rs.onError(t -> {
-				failed = true;
-				failure = String.valueOf(t);
-			});
+			rs.onError(t -> lateError = String.valueOf(t)); // keep what was collected; note the error
 			rs.startAsync();
 			stream = rs;
 			return true;
@@ -95,7 +93,12 @@ final class JfrStallRecorder {
 		if (!isRenderThread(e.getThread())) {
 			return;
 		}
-		String where = kind + " @ " + topFrame(e.getStackTrace());
+		String where;
+		try {
+			where = kind + " @ " + topFrame(e.getStackTrace());
+		} catch (RuntimeException ex) {
+			where = kind + " @ ?";
+		}
 		synchronized (renderBlocks) {
 			long[] v = renderBlocks.computeIfAbsent(where, k -> new long[2]);
 			v[0]++;
@@ -108,8 +111,11 @@ final class JfrStallRecorder {
 			return "?";
 		}
 		for (RecordedFrame f : st.getFrames()) {
+			if (f == null || f.getMethod() == null || f.getMethod().getType() == null) {
+				continue;
+			}
 			String cls = f.getMethod().getType().getName();
-			if (cls.startsWith("java.") || cls.startsWith("jdk.") || cls.startsWith("sun.")) {
+			if (cls == null || cls.startsWith("java.") || cls.startsWith("jdk.") || cls.startsWith("sun.")) {
 				continue; // skip the JDK plumbing (Object.wait, LockSupport.park, ...) to the caller
 			}
 			int dot = cls.lastIndexOf('.');
@@ -124,16 +130,23 @@ final class JfrStallRecorder {
 		stream = null;
 		if (rs != null) {
 			try {
-				rs.close();
-				rs.awaitTermination(Duration.ofMillis(1500));
+				rs.stop(); // flushes and waits until the buffered events have been consumed (JDK 20+)
 			} catch (Throwable ignored) {
 				// summary below uses whatever arrived
+			}
+			try {
+				rs.close();
+			} catch (Throwable ignored) {
+				// nothing to do
 			}
 		}
 		List<String> lines = new ArrayList<>();
 		if (rs == null || failed) {
 			lines.add("JVM stalls: Flight Recorder unavailable (" + failure + ")");
 			return lines;
+		}
+		if (!lateError.isEmpty()) {
+			lines.add("JVM stalls: Flight Recorder reported an error mid-profile (" + lateError + "); numbers below may be incomplete.");
 		}
 		lines.add(String.format(Locale.ROOT, "JVM during the profile: GC pauses %d (%.1f ms) | ZGC allocation stalls %d (%.1f ms), of which on the render thread %d (%.1f ms)",
 				gcPauses.get(), gcPauseNanos.get() / 1e6, allocStalls.get(), allocStallNanos.get() / 1e6,

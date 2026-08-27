@@ -48,6 +48,8 @@ public final class HitchProfiler implements FrameStats.FrameListener {
 	private final long[] longestNanos = new long[5];
 	private final String[] longestWhat = new String[5];
 	private JfrStallRecorder jfr;
+	/** Frames that began before the profile did (the command's own frame) are not counted. */
+	private long profileStartNanos;
 	private Consumer<List<String>> reporter;
 
 	private HitchProfiler() {}
@@ -76,8 +78,8 @@ public final class HitchProfiler implements FrameStats.FrameListener {
 		java.util.Arrays.fill(histogram, 0);
 		java.util.Arrays.fill(longestNanos, 0);
 		java.util.Arrays.fill(longestWhat, null);
-		jfr = new JfrStallRecorder(renderThread);
-		jfr.start();
+		jfr = null;
+		profileStartNanos = System.nanoTime();
 		running = true;
 		generation++;
 		int myGeneration = generation;
@@ -89,30 +91,60 @@ public final class HitchProfiler implements FrameStats.FrameListener {
 		return true;
 	}
 
-	public synchronized void stop() {
-		if (!running) {
-			return;
-		}
-		running = false;
-		FrameStats.INSTANCE.removeListener(this);
-		List<String> report = buildReport();
-		if (jfr != null) {
-			report.addAll(jfr.stopAndReport());
+	public void stop() {
+		List<String> report;
+		JfrStallRecorder recorder;
+		Consumer<List<String>> r;
+		synchronized (this) {
+			if (!running) {
+				return;
+			}
+			running = false;
+			FrameStats.INSTANCE.removeListener(this);
+			report = buildReport();
+			recorder = jfr;
 			jfr = null;
+			java.util.Arrays.fill(samples, null); // ~100 MB of stack traces otherwise stays referenced
+			r = reporter;
+			reporter = null;
 		}
-		java.util.Arrays.fill(samples, null); // ~100 MB of stack traces otherwise stays referenced
-		Consumer<List<String>> r = reporter;
-		reporter = null;
-		for (String line : report) {
-			DhAffinity.LOG.info("[profile] {}", line);
-		}
-		if (r != null) {
-			r.accept(report);
-		}
+		// Stopping Flight Recorder waits for its buffers to drain: never do that on the render thread.
+		Thread finisher = new Thread(() -> {
+			if (recorder != null) {
+				try {
+					report.addAll(recorder.stopAndReport());
+				} catch (Throwable t) {
+					report.add("JVM stalls: Flight Recorder summary failed (" + t + ")");
+				}
+			}
+			for (String line : report) {
+				DhAffinity.LOG.info("[profile] {}", line);
+			}
+			if (r != null) {
+				r.accept(report);
+			}
+		}, "DHAffinity-Profiler-Report");
+		finisher.setDaemon(true);
+		finisher.start();
 	}
 
 	private void sampleLoop(int myGeneration) {
 		Thread target = renderThread;
+		// Flight Recorder's first start costs hundreds of milliseconds: do it here, never on the render thread.
+		JfrStallRecorder recorder = null;
+		try {
+			recorder = new JfrStallRecorder(target);
+			if (!recorder.start()) {
+				recorder = null;
+			}
+		} catch (Throwable t) { // no jdk.jfr module, or JFR refused
+			recorder = null;
+		}
+		synchronized (this) {
+			if (generation == myGeneration) {
+				jfr = recorder;
+			}
+		}
 		while (running && target != null) {
 			long now = System.nanoTime();
 			synchronized (this) {
@@ -143,8 +175,8 @@ public final class HitchProfiler implements FrameStats.FrameListener {
 
 	@Override
 	public synchronized void onFrame(long startNanos, long endNanos, boolean hitch) {
-		if (!running) {
-			return;
+		if (!running || startNanos < profileStartNanos) {
+			return; // not running, or the frame that issued the command
 		}
 		frames++;
 		if (hitch) {
